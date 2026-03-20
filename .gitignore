@@ -23,10 +23,11 @@ test_debug.go
 Thumbs.db
 .DS_Store
 
-tools/raw-accounts-input.txt
-tools/normalized-accounts-output.txt
-tools/normalize-stderr.txt
-tools/jwt-import.txt
-tools/*-jwt-lines.txt
-tools/refresh-import.txt
-tools/jwt-windsurf.txt
+# tools：可能含邮箱、密码、Token、JWT 的本地文件（勿提交）
+tools/**/*.txt
+tools/**/*.csv
+tools/**/*.log
+
+# 应用数据若误放在仓库根目录
+accounts.json
+settings.json

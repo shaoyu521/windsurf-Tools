@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	// FirebaseAPIKey：Firebase Identity Toolkit 的 Web 客户端 Key（与 Windsurf 网页端相同，非用户个人密钥）。勿将用户密码/Refresh Token/sk-ws API Key 写入仓库，见 SECURITY.md。
 	FirebaseAPIKey   = "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY"
 	WindsurfBaseURL  = "https://web-backend.windsurf.com"
 	GRPCUpstreamHost = "server.self-serve.windsurf.com"

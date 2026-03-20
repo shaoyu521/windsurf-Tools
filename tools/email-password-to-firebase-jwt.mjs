@@ -3,7 +3,8 @@
  *
  * 与密码导入写入的 acc.Token 一致，可显著减少导入时 UI 卡顿（JWT 导入不做 RegisterUser 等网络补全）。
  *
- * 用法:
+ * 用法（须先设置 FIREBASE_WEB_API_KEY，与 backend/services/windsurf.go 中 FirebaseAPIKey 一致）:
+ *   set FIREBASE_WEB_API_KEY=...
  *   node tools/email-password-to-firebase-jwt.mjs tools/normalized-accounts-output.txt > jwt-import.txt
  *   node tools/email-password-to-firebase-jwt.mjs --concurrency=5 your.txt
  *   node tools/email-password-to-firebase-jwt.mjs accounts.txt --write-refresh=refresh-import.txt > jwt-import.txt
@@ -14,10 +15,17 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs'
 
-/** 与 backend/services/windsurf.go FirebaseAPIKey 一致 */
-const FIREBASE_WEB_KEY = 'AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY'
-
-const SIGN_IN_URL = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_KEY}`
+function resolveSignInUrl() {
+  const k = (process.env.FIREBASE_WEB_API_KEY || process.env.QUICK_KEY_FIREBASE_WEB_API_KEY || '').trim()
+  if (!k) {
+    console.error(
+      '错误: 请设置环境变量 FIREBASE_WEB_API_KEY（或 QUICK_KEY_FIREBASE_WEB_API_KEY）\n' +
+        '本地可与 backend/services/windsurf.go 中 FirebaseAPIKey 一致；勿将含邮箱密码的文件提交 Git（见 SECURITY.md）。',
+    )
+    process.exit(2)
+  }
+  return `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${k}`
+}
 
 function parseArgs(argv) {
   let concurrency = 4
@@ -54,14 +62,14 @@ function parseAccountPasswordLine(line) {
   return { email: m[1], passwords }
 }
 
-async function signInWithPassword(email, password) {
+async function signInWithPassword(signInUrl, email, password) {
   const body = JSON.stringify({
     returnSecureToken: true,
     email,
     password,
     clientType: 'CLIENT_TYPE_WEB',
   })
-  const resp = await fetch(SIGN_IN_URL, {
+  const resp = await fetch(signInUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,
@@ -83,11 +91,11 @@ async function signInWithPassword(email, password) {
   return { idToken: j.idToken, refreshToken: j.refreshToken }
 }
 
-async function tryLogin(email, passwords) {
+async function tryLogin(signInUrl, email, passwords) {
   let lastErr = null
   for (const pw of passwords) {
     try {
-      const { idToken, refreshToken } = await signInWithPassword(email, pw)
+      const { idToken, refreshToken } = await signInWithPassword(signInUrl, email, pw)
       return {
         idToken,
         refreshToken,
@@ -103,6 +111,7 @@ async function tryLogin(email, passwords) {
 async function main() {
   const argv = process.argv.slice(2)
   const { concurrency, file, writeRefresh } = parseArgs(argv)
+  const signInUrl = resolveSignInUrl()
   const raw = file && file !== '-' ? readFileSync(file, 'utf8') : readFileSync(0, 'utf8')
 
   const rows = []
@@ -127,7 +136,7 @@ async function main() {
     await Promise.all(
       chunk.map(async (row) => {
         try {
-          const { idToken, refreshToken, usedAlt } = await tryLogin(row.email, row.passwords)
+          const { idToken, refreshToken, usedAlt } = await tryLogin(signInUrl, row.email, row.passwords)
           ok.push({ email: row.email, idToken, refreshToken, usedAlt })
         } catch (e) {
           fail.push({ email: row.email, err: String(e?.message || e) })

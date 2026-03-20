@@ -3,7 +3,7 @@
 使用前设置环境变量（勿将真实密码提交到 Git）：
   set QUICK_KEY_EMAIL=...
   set QUICK_KEY_PASSWORD=...
-可选：set QUICK_KEY_FIREBASE_WEB_API_KEY=...（默认与 Windsurf Web 客户端一致）
+必填：set FIREBASE_WEB_API_KEY=... 或 QUICK_KEY_FIREBASE_WEB_API_KEY=...（与 backend/services/windsurf.go 中 FirebaseAPIKey 一致）
 """
 import base64
 import json
@@ -16,10 +16,21 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 EMAIL = os.environ.get("QUICK_KEY_EMAIL", "").strip()
 PASSWORD = os.environ.get("QUICK_KEY_PASSWORD", "").strip()
-FK = os.environ.get("QUICK_KEY_FIREBASE_WEB_API_KEY", "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY").strip()
+FK = (
+    os.environ.get("FIREBASE_WEB_API_KEY")
+    or os.environ.get("QUICK_KEY_FIREBASE_WEB_API_KEY")
+    or ""
+).strip()
 
 if not EMAIL or not PASSWORD:
     print("请设置环境变量 QUICK_KEY_EMAIL 与 QUICK_KEY_PASSWORD", file=sys.stderr)
+    sys.exit(1)
+
+if not FK:
+    print(
+        "请设置环境变量 FIREBASE_WEB_API_KEY 或 QUICK_KEY_FIREBASE_WEB_API_KEY（勿写入仓库；可与 windsurf.go 中 FirebaseAPIKey 一致）",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 ctx = ssl.create_default_context()

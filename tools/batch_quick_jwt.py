@@ -8,8 +8,12 @@
   账号: email@x.com 密码: xxx [ 日期 ] [ 密码不对就这个 备用 ]
 
 用法:
+  set FIREBASE_WEB_API_KEY=你的_Firebase_Web_Key
   python tools/batch_quick_jwt.py tools/normalized-accounts-output.txt -o tools/jwt-windsurf.txt
   python tools/batch_quick_jwt.py accounts.txt -o out.txt -j 6
+
+环境变量 FIREBASE_WEB_API_KEY（或 QUICK_KEY_FIREBASE_WEB_API_KEY）必填；值可与本地 backend/services/windsurf.go 中 FirebaseAPIKey 一致。
+勿将含邮箱/密码的输入文件提交 Git（见 SECURITY.md）。
 
 仅依赖 Python 3 标准库（HTTPS + gRPC-over-HTTP 帧，与 backend/services/windsurf.go 对齐）。
 """
@@ -18,6 +22,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import re
 import ssl
 import sys
@@ -26,8 +31,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
-# 与 backend/services/windsurf.go 一致
-FK = "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY"
 WINDSURF_APP = "windsurf"
 WINDSURF_VERSION = "1.48.2"
 WINDSURF_CLIENT = "1.9566.11"
@@ -35,8 +38,28 @@ GRPC_UPSTREAM_HOST = "server.self-serve.windsurf.com"
 GRPC_UPSTREAM_IP = "34.49.14.144"
 GRPC_JWT_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
 
-FIREBASE_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FK}"
 REGISTER_URL = "https://api.codeium.com/register_user/"
+
+# 由 ensure_firebase_sign_in_url() 在启动时填充，避免把 Key 写进仓库
+FIREBASE_SIGN_IN_URL: str = ""
+
+
+def ensure_firebase_sign_in_url() -> None:
+    global FIREBASE_SIGN_IN_URL
+    k = (
+        os.environ.get("FIREBASE_WEB_API_KEY")
+        or os.environ.get("QUICK_KEY_FIREBASE_WEB_API_KEY")
+        or ""
+    ).strip()
+    if not k:
+        sys.stderr.write(
+            "错误: 请设置环境变量 FIREBASE_WEB_API_KEY（或 QUICK_KEY_FIREBASE_WEB_API_KEY）\n"
+            "本地可与 backend/services/windsurf.go 中 FirebaseAPIKey 一致；勿提交含账号密码的输入文件。\n"
+        )
+        raise SystemExit(2)
+    FIREBASE_SIGN_IN_URL = (
+        "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + k
+    )
 
 
 def _stdout_utf8() -> None:
@@ -161,7 +184,7 @@ def http_json_post(url: str, payload: dict, ctx: ssl.SSLContext, timeout: float 
 
 def firebase_sign_in(email: str, password: str, ctx: ssl.SSLContext) -> Tuple[str, str]:
     data = http_json_post(
-        FIREBASE_URL,
+        FIREBASE_SIGN_IN_URL,
         {
             "email": email,
             "password": password,
@@ -269,6 +292,7 @@ def get_ctx() -> ssl.SSLContext:
 
 def main() -> int:
     _stdout_utf8()
+    ensure_firebase_sign_in_url()
     ap = argparse.ArgumentParser(description="批量 Firebase → RegisterUser → GetUserJwt")
     ap.add_argument("input", help="账号密码文件（每行 账号:… 密码:…）")
     ap.add_argument("-o", "--output", required=True, help="输出：每行「JWT 备注」")

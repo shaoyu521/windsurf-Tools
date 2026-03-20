@@ -86,11 +86,21 @@ wails dev
   - `%APPDATA%\windsurf-tools-wails\settings.json`
 - **请勿**将含有真实 Token / 密码的 `accounts.json` 提交到 Git 或公开分享。
 
+### 勿向 GitHub 提交敏感信息
+
+完整约定见 **[SECURITY.md](SECURITY.md)**。请尤其避免提交：
+
+- 真实 **邮箱+密码**、**Refresh Token**、**JWT**、**个人 Windsurf API Key**（`sk-ws-...`）
+- 本机 **`accounts.json` / `settings.json`**（若误放在项目根目录，已被 `.gitignore` 排除）
+- `tools/` 下可能含账号信息的 **`*.txt` / `*.csv` / `*.log`**（已默认忽略）
+
 ---
 
 ## 辅助脚本（`tools/`）
 
-仓库内 `tools/` 目录包含若干 Node / Python 辅助脚本（格式转换、批处理 JWT 等）。根目录 `_quick_key.py` 为单账号调试示例，**凭据通过环境变量传入**，请勿把真实密码写入文件或提交到 Git。
+仓库内 `tools/` 目录包含若干 Node / Python 辅助脚本（格式转换、批处理 JWT 等）。运行前请在本机设置环境变量 **`FIREBASE_WEB_API_KEY`**（或 `QUICK_KEY_FIREBASE_WEB_API_KEY`），值可与 `backend/services/windsurf.go` 中的 **`FirebaseAPIKey`** 一致（Firebase 网页端 Key，**不是**你的账号密码）。
+
+根目录 **`_quick_key.py`** 需同时设置 `QUICK_KEY_EMAIL`、`QUICK_KEY_PASSWORD` 与上述 Firebase Key，**勿**把真实密码写入文件或提交到 Git。
 
 ---
 
