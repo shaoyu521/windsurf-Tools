@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    @apply h-full m-0 p-0 antialiased select-none;
+    background-color: theme('colors.ios.bg');
+    color: theme('colors.ios.text');
+  }
+
+  @media (prefers-color-scheme: dark) {
+    html, body {
+      background-color: theme('colors.ios.bgDark');
+      color: theme('colors.ios.textDark');
+    }
+  }
+
+  #app {
+    @apply h-screen flex flex-col overflow-hidden;
+  }
+}
+
+/* 主壳轻量层次：不抢内容焦点 */
+.app-root {
+  background:
+    radial-gradient(ellipse 120% 80% at 100% 0%, rgba(0, 122, 255, 0.08), transparent 50%),
+    radial-gradient(ellipse 100% 60% at 0% 100%, rgba(52, 199, 89, 0.06), transparent 45%);
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-root {
+    background:
+      radial-gradient(ellipse 120% 80% at 100% 0%, rgba(10, 132, 255, 0.12), transparent 50%),
+      radial-gradient(ellipse 100% 60% at 0% 100%, rgba(48, 209, 88, 0.08), transparent 45%),
+      theme('colors.ios.bgDark');
+  }
+}
+
+@layer components {
+  /* Wails App Window Draggable Region */
+  .drag-region {
+    --wails-draggable: drag;
+  }
+  .no-drag-region {
+    --wails-draggable: no-drag;
+  }
+
+  /* Core iOS Glass Effect with Premium Shadows */
+  .ios-glass {
+    @apply bg-white/75 backdrop-blur-[24px];
+    box-shadow: 0 8px 32px -4px rgba(0, 0, 0, 0.04), 0 0 1px 0 rgba(0,0,0,0.1) inset;
+  }
+  
+  @media (prefers-color-scheme: dark) {
+    .ios-glass {
+      @apply bg-[#1C1C1E]/75;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 8px 32px -4px rgba(0, 0, 0, 0.25);
+    }
+  }
+
+  /* iOS Button Base with Spring Curve */
+  .ios-btn {
+    @apply active:scale-[0.96] transition-all duration-[250ms] ease-[cubic-bezier(0.2,0.8,0.2,1)];
+  }
+}

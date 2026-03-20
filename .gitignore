@@ -1,0 +1,33 @@
+build/bin
+node_modules
+frontend/dist
+frontend/node_modules
+
+# 勿提交：含本地调试凭证 / 密钥样例
+_quick_key.py
+test_debug.go
+
+# Cursor / 缓存
+.cursor/
+**/__pycache__/
+*.pyc
+
+# Local / secrets
+.env
+.env.*
+*.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+tools/raw-accounts-input.txt
+tools/normalized-accounts-output.txt
+tools/normalize-stderr.txt
+tools/jwt-import.txt
+tools/*-jwt-lines.txt
+tools/refresh-import.txt
+tools/jwt-windsurf.txt

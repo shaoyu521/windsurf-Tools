@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "windsurf-tools-wails",
+  "outputfilename": "windsurf-tools-wails",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://127.0.0.1:3457",
+  "author": {
+    "name": "shaoyu521",
+    "email": "shaoyu521@github.com"
+  }
+}
