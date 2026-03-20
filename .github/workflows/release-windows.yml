@@ -43,18 +43,27 @@ jobs:
       - name: Wails build
         run: wails build
 
-      - name: Package zip
+      - name: Package exe, zip and checksums
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = "build/bin/windsurf-tools-wails.exe"
+          Copy-Item -Force $exe "dist/windsurf-tools-wails.exe"
           $zip = "dist/windsurf-tools-wails-windows-amd64.zip"
-          Compress-Archive -Path "build/bin/windsurf-tools-wails.exe" -DestinationPath $zip -Force
-          Get-Item $zip | Format-List Name, Length
+          Compress-Archive -Path "dist/windsurf-tools-wails.exe" -DestinationPath $zip -Force
+          $hExe = (Get-FileHash "dist/windsurf-tools-wails.exe" -Algorithm SHA256).Hash.ToLower()
+          $hZip = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $sum = "$hExe  windsurf-tools-wails.exe`n$hZip  windsurf-tools-wails-windows-amd64.zip`n"
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "dist/SHA256SUMS.txt"), $sum, [System.Text.UTF8Encoding]::new($false))
+          Get-ChildItem dist | Format-Table Name, Length
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/windsurf-tools-wails-windows-amd64.zip
+          files: |
+            dist/windsurf-tools-wails.exe
+            dist/windsurf-tools-wails-windows-amd64.zip
+            dist/SHA256SUMS.txt
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
