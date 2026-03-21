@@ -35,6 +35,18 @@ const accountStore = useAccountStore()
 let autoSaveDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let saveStateResetTimer: ReturnType<typeof setTimeout> | null = null
 
+const detectTraySupport = () => {
+  if (typeof navigator === 'undefined') {
+    return true
+  }
+  const nav = navigator as Navigator & { userAgentData?: { platform?: string } }
+  const platformText = [navigator.userAgent, navigator.platform, nav.userAgentData?.platform]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return platformText.includes('win')
+}
+
 const poolPlanCounts = computed<Partial<Record<SwitchPlanTone, number>>>(() => {
   const m: Partial<Record<SwitchPlanTone, number>> = {}
   for (const t of SWITCH_PLAN_FILTER_TONES) {
@@ -52,6 +64,12 @@ const showSaved = ref(false)
 const isSyncingLocal = ref(true)
 const saveState = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
 const lastSavedFingerprint = ref('')
+const traySupported = computed(() => detectTraySupport())
+const silentStartHint = computed(() =>
+  traySupported.value
+    ? '启动时不弹主窗口直接挂载托盘后台。'
+    : '当前平台构建未启用系统托盘；若同时开启桌面工具栏，会直接以小工具栏形态启动，否则仍正常显示主窗口。',
+)
 
 const local = reactive<SettingsForm>(settingsToForm(createDefaultSettings()))
 
@@ -94,6 +112,21 @@ watch(
     scheduleAutoSave()
   },
   { deep: true },
+)
+
+watch(
+  () => traySupported.value,
+  (supported) => {
+    if (!supported) {
+      if (local.minimize_to_tray) {
+        local.minimize_to_tray = false
+      }
+      if (local.silent_start && !local.show_desktop_toolbar) {
+        local.silent_start = false
+      }
+    }
+  },
+  { immediate: true },
 )
 
 const buildSettingsPayload = () =>
@@ -343,11 +376,16 @@ onUnmounted(() => {
                 <div class="flex-1">
                   <div class="text-[16px] font-bold text-gray-900 dark:text-gray-100 mb-1">关闭时隐藏至系统托盘</div>
                   <div class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed font-medium">
-                    开启后点击右上角关闭只会隐藏到托盘；关闭本项后点击关闭会真正退出，并自动恢复 MITM 的 hosts / ProxyOverride / Codeium 配置 / CA 环境。
+                    <template v-if="traySupported">
+                      开启后点击右上角关闭只会隐藏到托盘；关闭本项后点击关闭会真正退出，并自动恢复 MITM 的 hosts / ProxyOverride / Codeium 配置 / CA 环境。
+                    </template>
+                    <template v-else>
+                      当前平台构建未启用系统托盘；关闭窗口会直接退出，并自动恢复 MITM 的 hosts / ProxyOverride / Codeium 配置 / CA 环境。
+                    </template>
                   </div>
                 </div>
               </div>
-              <IToggle v-model="local.minimize_to_tray" class="shrink-0" />
+              <IToggle v-model="local.minimize_to_tray" :disabled="!traySupported" class="shrink-0" />
             </div>
 
             <div class="p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-black/[0.04] dark:border-white/[0.04]">
@@ -377,7 +415,7 @@ onUnmounted(() => {
                 <div class="flex-1">
                   <div class="text-[16px] font-bold text-gray-900 dark:text-gray-100 mb-1">静默启动</div>
                   <div class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed font-medium">
-                    启动时不弹主窗口直接挂载托盘后台。
+                    {{ silentStartHint }}
                   </div>
                 </div>
               </div>

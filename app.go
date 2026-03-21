@@ -27,6 +27,7 @@ type App struct {
 	mu                     sync.Mutex
 	cleanupMitmOnExitFn    func() error
 	activateExistingAppFn  func(showToolbar bool)
+	traySupportedFn        func() bool
 	// silentFromFlag 由 main 在解析到 --silent 时设置，与 settings.silent_start 二选一即可触发静默启动
 	silentFromFlag bool
 }
@@ -66,9 +67,16 @@ func (a *App) initBackend() error {
 
 func (a *App) shouldStartHidden() bool {
 	if a.store == nil {
-		return a.silentFromFlag
+		return a.silentFromFlag && a.supportsTray()
 	}
-	return a.silentFromFlag || a.store.GetSettings().SilentStart
+	settings := a.store.GetSettings()
+	if settings.ShowDesktopToolbar {
+		return a.silentFromFlag || settings.SilentStart
+	}
+	if !a.supportsTray() {
+		return false
+	}
+	return a.silentFromFlag || settings.SilentStart
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -76,7 +84,9 @@ func (a *App) startup(ctx context.Context) {
 	if err := a.initBackend(); err != nil {
 		log.Fatalf("%v", err)
 	}
-	a.startTray()
+	if a.supportsTray() {
+		a.startTray()
+	}
 	settings := a.store.GetSettings()
 	if a.shouldStartHidden() {
 		if settings.ShowDesktopToolbar {

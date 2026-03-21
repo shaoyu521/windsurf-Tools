@@ -25,11 +25,11 @@ jobs:
             label: windows-amd64
             platform: windows/amd64
             artifact_name: windsurf-tools-wails-windows-amd64
-          - os: macos-13
+          - os: macos-15-intel
             label: macos-intel-amd64
             platform: darwin/amd64
             artifact_name: windsurf-tools-wails-macos-intel-amd64
-          - os: macos-14
+          - os: macos-15
             label: macos-apple-silicon-arm64
             platform: darwin/arm64
             artifact_name: windsurf-tools-wails-macos-apple-silicon-arm64

@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -5,12 +7,14 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// startTray 在后台线程运行系统托盘（Windows / macOS / Linux 需桌面环境）。
+// startTray 在后台线程运行系统托盘（当前仅 Windows 发布包启用）。
 func (a *App) startTray() {
 	go func() {
 		systray.Run(a.onTrayReady, func() {})
 	}()
 }
+
+func traySupported() bool { return true }
 
 func (a *App) onTrayReady() {
 	systray.SetIcon(currentTrayIcon())

@@ -77,7 +77,7 @@ func (a *App) onBeforeClose(ctx context.Context) bool {
 	if a.store == nil {
 		return false
 	}
-	if a.store.GetSettings().MinimizeToTray {
+	if a.store.GetSettings().MinimizeToTray && a.supportsTray() {
 		runtime.WindowHide(ctx)
 		return true
 	}

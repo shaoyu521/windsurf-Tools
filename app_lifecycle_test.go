@@ -83,3 +83,54 @@ func TestActivateExistingWindowUsesMainWindowWhenToolbarDisabled(t *testing.T) {
 		t.Fatal("onSecondInstanceLaunch() did not trigger activation hook")
 	}
 }
+
+func TestShouldStartHiddenRequiresTrayWhenToolbarDisabled(t *testing.T) {
+	app := NewApp()
+	app.silentFromFlag = true
+	app.traySupportedFn = func() bool { return false }
+
+	if app.shouldStartHidden() {
+		t.Fatal("shouldStartHidden() should ignore silent start when tray is unavailable and toolbar is disabled")
+	}
+}
+
+func TestShouldStartHiddenAllowsToolbarModeWithoutTray(t *testing.T) {
+	s, err := store.NewStoreInPaths(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStoreInPaths() error = %v", err)
+	}
+	settings := s.GetSettings()
+	settings.SilentStart = true
+	settings.ShowDesktopToolbar = true
+	if err := s.UpdateSettings(settings); err != nil {
+		t.Fatalf("UpdateSettings() error = %v", err)
+	}
+
+	app := NewApp()
+	app.store = s
+	app.traySupportedFn = func() bool { return false }
+
+	if !app.shouldStartHidden() {
+		t.Fatal("shouldStartHidden() should still allow toolbar mode without tray support")
+	}
+}
+
+func TestOnBeforeCloseIgnoresMinimizeToTrayWhenTrayUnavailable(t *testing.T) {
+	s, err := store.NewStoreInPaths(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStoreInPaths() error = %v", err)
+	}
+	settings := s.GetSettings()
+	settings.MinimizeToTray = true
+	if err := s.UpdateSettings(settings); err != nil {
+		t.Fatalf("UpdateSettings() error = %v", err)
+	}
+
+	app := NewApp()
+	app.store = s
+	app.traySupportedFn = func() bool { return false }
+
+	if app.onBeforeClose(context.Background()) {
+		t.Fatal("onBeforeClose() should not hide window when tray is unavailable")
+	}
+}

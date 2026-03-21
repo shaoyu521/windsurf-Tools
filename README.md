@@ -19,6 +19,8 @@
 | `SHA256SUMS.txt` | 全平台 | 所有发布文件的 SHA256 校验 |
 
 > macOS 发布包当前为 **未签名** 构建，首次打开可能需要在系统设置中允许应用运行。
+>
+> 为了保证 Intel / Apple Silicon 双架构发布稳定，当前 macOS 包默认关闭系统托盘集成；账号池、MITM、额度同步、桌面工具栏与单实例逻辑均可正常使用。
 
 ---
 
@@ -28,7 +30,7 @@
 | :---: |
 | ![Windsurf Tools 最新界面预览](docs/images/dashboard-preview.png) |
 
-> 当前仓库预览图已同步为最新桌面端截图，展示账号池页与「下一席位范围」卡片。源文件位于 `docs/images/dashboard-preview.png` 与 `build/browser-preview.png`。
+> 当前仓库预览图已同步为最新桌面端截图，展示控制台首页、MITM 面板与健康度概览。源文件位于 `docs/images/dashboard-preview.png` 与 `build/browser-preview.png`。
 
 ---
 
@@ -56,8 +58,9 @@
 ### macOS
 
 - 支持 **Intel (`amd64`)** 与 **Apple Silicon (`arm64`)**
-- 当前通过 GitHub Actions 分别在 `macos-13`（Intel）与 `macos-14`（Apple Silicon）原生 runner 上构建发布包
+- 当前通过 GitHub Actions 分别在 `macos-15-intel`（Intel）与 `macos-15`（Apple Silicon）原生 runner 上构建发布包
 - 当前为未签名构建，首次打开可能需要绕过 Gatekeeper
+- 当前 macOS 发布包默认不启用系统托盘，因此“关闭时隐藏至系统托盘”不会生效；点击关闭会真正退出并恢复 MITM 环境
 
 ---
 
@@ -113,6 +116,7 @@ wails dev
 - 开启“关闭时隐藏至系统托盘”：点击右上角关闭只隐藏窗口，不退出进程。
 - 关闭“关闭时隐藏至系统托盘”：点击右上角关闭会真正退出，并自动恢复 MITM 环境。
 - 托盘菜单“退出并恢复环境”：无论当前是否显示主窗口，都会完整退出并触发环境清理。
+- macOS Intel / Apple Silicon 发布包为兼容构建，默认不启用系统托盘；若开启桌面工具栏，可继续用静默启动直接进入小工具栏模式。
 
 ---
 
@@ -187,17 +191,17 @@ wails dev
 仓库已配置 [GitHub Actions 发布工作流](.github/workflows/release-windows.yml)。推送 `v*` 标签后会自动：
 
 1. 在 `windows-latest` 上构建 Windows `amd64`
-2. 在 `macos-13` 上构建 macOS Intel `amd64`
-3. 在 `macos-14` 上构建 macOS Apple Silicon `arm64`
+2. 在 `macos-15-intel` 上构建 macOS Intel `amd64`
+3. 在 `macos-15` 上构建 macOS Apple Silicon `arm64`
 4. 汇总生成 `SHA256SUMS.txt`
 5. 自动发布到 GitHub Release
 
 示例：
 
 ```bash
-git tag v0.2.0 -m "v0.2.0"
+git tag v0.2.1 -m "v0.2.1"
 git push origin main
-git push origin v0.2.0
+git push origin v0.2.1
 ```
 
 请确认仓库已启用 GitHub Actions，且 `GITHUB_TOKEN` 拥有 `contents: write` 权限。

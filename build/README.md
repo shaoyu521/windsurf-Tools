@@ -23,6 +23,7 @@ The directory contains the following files:
 Repository release workflow note:
 
 - GitHub Actions currently builds separate macOS release assets for Intel (`darwin/amd64`) and Apple Silicon (`darwin/arm64`).
+- Current release runners are `macos-15-intel` and `macos-15`, and the macOS packages intentionally skip tray integration to keep cross-platform builds stable.
 
 ## Windows
 
