@@ -34,23 +34,61 @@ func (s *SwitchService) windsurfAuthPathCandidates() []string {
 	if err != nil || home == "" {
 		return nil
 	}
-	switch runtime.GOOS {
+	configRoot, configErr := os.UserConfigDir()
+	if configErr != nil || strings.TrimSpace(configRoot) == "" {
+		configRoot = filepath.Join(home, ".config")
+	}
+	return windsurfAuthPathCandidatesFor(runtime.GOOS, home, os.Getenv("APPDATA"), configRoot)
+}
+
+func windsurfAuthPathCandidatesFor(goos, home, appData, configRoot string) []string {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return nil
+	}
+	configRoot = strings.TrimSpace(configRoot)
+	if configRoot == "" {
+		configRoot = filepath.Join(home, ".config")
+	}
+
+	switch strings.ToLower(strings.TrimSpace(goos)) {
 	case "windows":
-		appdata := os.Getenv("APPDATA")
-		if appdata == "" {
-			appdata = filepath.Join(home, "AppData", "Roaming")
+		if strings.TrimSpace(appData) == "" {
+			appData = filepath.Join(home, "AppData", "Roaming")
 		}
-		base := filepath.Join(appdata, ".codeium", "windsurf", "config")
+		base := filepath.Join(appData, ".codeium", "windsurf", "config")
 		return []string{filepath.Join(base, "windsurf_auth.json")}
 	case "darwin":
-		return []string{
+		return uniqueCandidatePaths([]string{
 			filepath.Join(home, ".codeium", "windsurf", "config", "windsurf_auth.json"),
 			filepath.Join(home, "Library", "Application Support", "Windsurf", "User", "globalStorage", "windsurf_auth.json"),
-		}
+		})
 	default:
-		base := filepath.Join(home, ".codeium", "windsurf", "config")
-		return []string{filepath.Join(base, "windsurf_auth.json")}
+		return uniqueCandidatePaths([]string{
+			filepath.Join(home, ".codeium", "windsurf", "config", "windsurf_auth.json"),
+			filepath.Join(configRoot, "Windsurf", "User", "globalStorage", "windsurf_auth.json"),
+			filepath.Join(configRoot, "windsurf", "User", "globalStorage", "windsurf_auth.json"),
+			filepath.Join(configRoot, "Codeium", "User", "globalStorage", "windsurf_auth.json"),
+			filepath.Join(configRoot, "codeium", "User", "globalStorage", "windsurf_auth.json"),
+		})
 	}
+}
+
+func uniqueCandidatePaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = filepath.Clean(strings.TrimSpace(p))
+		if p == "." || p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }
 
 // resolveAuthPath 优先返回已存在的 auth 文件路径，否则返回首选写入路径（与旧版行为一致：~/.codeium/...）。

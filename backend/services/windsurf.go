@@ -540,7 +540,7 @@ func buildAPIKeyMetadata(apiKey string) []byte {
 	metadata = append(metadata, utils.EncodeStringField(2, WindsurfVersion)...)
 	metadata = append(metadata, utils.EncodeStringField(3, apiKey)...)
 	metadata = append(metadata, utils.EncodeStringField(4, "en")...)
-	metadata = append(metadata, utils.EncodeStringField(5, "windows")...)
+	metadata = append(metadata, utils.EncodeStringField(5, currentWindsurfClientPlatform())...)
 	metadata = append(metadata, utils.EncodeStringField(7, WindsurfClient)...)
 	metadata = append(metadata, utils.EncodeStringField(12, WindsurfAppName)...)
 	return metadata

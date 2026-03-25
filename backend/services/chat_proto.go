@@ -223,7 +223,7 @@ func buildChatMetadata(apiKey, jwt string) []byte {
 	meta = append(meta, utils.EncodeStringField(2, WindsurfVersion)...)
 	meta = append(meta, utils.EncodeStringField(3, apiKey)...)
 	meta = append(meta, utils.EncodeStringField(4, "en")...)
-	meta = append(meta, utils.EncodeStringField(5, "windows")...)
+	meta = append(meta, utils.EncodeStringField(5, currentWindsurfClientPlatform())...)
 	meta = append(meta, utils.EncodeStringField(7, WindsurfClient)...)
 	meta = append(meta, utils.EncodeStringField(12, WindsurfAppName)...)
 	if jwt != "" {

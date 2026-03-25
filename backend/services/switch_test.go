@@ -88,3 +88,40 @@ func TestWriteAuthFile(t *testing.T) {
 		t.Fatalf("WriteAuthFile() output missing email: %s", got)
 	}
 }
+
+func TestWindsurfAuthPathCandidatesForLinuxIncludesGlobalStorage(t *testing.T) {
+	homeDir := t.TempDir()
+	configRoot := filepath.Join(homeDir, ".config")
+
+	got := windsurfAuthPathCandidatesFor("linux", homeDir, "", configRoot)
+	want := []string{
+		filepath.Join(homeDir, ".codeium", "windsurf", "config", "windsurf_auth.json"),
+		filepath.Join(configRoot, "Windsurf", "User", "globalStorage", "windsurf_auth.json"),
+		filepath.Join(configRoot, "windsurf", "User", "globalStorage", "windsurf_auth.json"),
+	}
+
+	for _, candidate := range want {
+		found := false
+		for _, path := range got {
+			if filepath.Clean(path) == filepath.Clean(candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("linux candidates missing %q in %#v", candidate, got)
+		}
+	}
+}
+
+func TestUniqueCandidatePathsRemovesDuplicates(t *testing.T) {
+	got := uniqueCandidatePaths([]string{
+		"",
+		"C:\\Temp\\A",
+		"/tmp/x",
+		"/tmp/x",
+	})
+	if len(got) != 2 {
+		t.Fatalf("uniqueCandidatePaths len = %d, want 2 (%#v)", len(got), got)
+	}
+}

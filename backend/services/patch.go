@@ -15,6 +15,11 @@ import (
 // PatchService handles the seamless switching patch for Windsurf's extension.js
 type PatchService struct{}
 
+var (
+	lookPathFn     = exec.LookPath
+	evalSymlinksFn = filepath.EvalSymlinks
+)
+
 func NewPatchService() *PatchService {
 	return &PatchService{}
 }
@@ -51,18 +56,16 @@ func (p *PatchService) FindWindsurfPath() (string, error) {
 		)
 	default: // linux
 		home, _ := os.UserHomeDir()
-		candidates = append(candidates,
-			"/opt/Windsurf",
-			"/usr/share/windsurf",
-			filepath.Join(home, ".local", "share", "Windsurf"),
-		)
+		candidates = append(candidates, linuxWindsurfInstallCandidates(home)...)
 	}
 
 	relPath := getExtensionJSRelativePath()
-	for _, c := range candidates {
-		extFile := filepath.Join(c, relPath)
-		if _, err := os.Stat(extFile); err == nil {
-			return c, nil
+	for _, candidate := range candidates {
+		for _, root := range installRootsForCandidate(candidate) {
+			extFile := filepath.Join(root, relPath)
+			if _, err := os.Stat(extFile); err == nil {
+				return root, nil
+			}
 		}
 	}
 	return "", fmt.Errorf("未找到Windsurf安装路径")
@@ -280,6 +283,106 @@ func restartWindsurfFromInstall(installRoot string) error {
 	default: // linux
 		_ = exec.Command("pkill", "-f", "windsurf").Run()
 		time.Sleep(2 * time.Second)
-		return exec.Command("windsurf").Start()
+		exePath := resolveLinuxWindsurfExecutablePath(installRoot)
+		if exePath == "" {
+			return fmt.Errorf("未找到Windsurf可执行文件")
+		}
+		return exec.Command(exePath).Start()
 	}
+}
+
+func linuxWindsurfInstallCandidates(home string) []string {
+	candidates := []string{
+		"/opt/Windsurf",
+		"/opt/windsurf",
+		"/usr/share/windsurf",
+		"/usr/lib/windsurf",
+		"/usr/lib/Windsurf",
+		filepath.Join(home, ".local", "share", "Windsurf"),
+		filepath.Join(home, ".local", "share", "windsurf"),
+	}
+	for _, name := range []string{"windsurf", "Windsurf"} {
+		if path, err := lookPathFn(name); err == nil && strings.TrimSpace(path) != "" {
+			candidates = append(candidates, path)
+			if resolved, err := evalSymlinksFn(path); err == nil && strings.TrimSpace(resolved) != "" {
+				candidates = append(candidates, resolved)
+			}
+		}
+	}
+	return uniqueCandidatePaths(candidates)
+}
+
+func installRootsForCandidate(candidate string) []string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return nil
+	}
+	candidate = filepath.Clean(candidate)
+	fi, err := os.Stat(candidate)
+	if err == nil && fi.IsDir() {
+		return []string{candidate}
+	}
+	if err == nil {
+		dir := filepath.Dir(candidate)
+		roots := []string{dir}
+		base := strings.ToLower(filepath.Base(dir))
+		if base == "bin" || base == "share" {
+			roots = append(roots, filepath.Dir(dir))
+		}
+		return uniqueCandidatePaths(roots)
+	}
+	if strings.Contains(candidate, string(filepath.Separator)) {
+		return []string{candidate}
+	}
+	return nil
+}
+
+func resolveLinuxWindsurfExecutablePath(installRoot string) string {
+	candidates := []string{}
+	root := strings.TrimSpace(installRoot)
+	if root != "" {
+		if fi, err := os.Stat(root); err == nil {
+			if fi.IsDir() {
+				candidates = append(candidates, linuxExecutableCandidatesFromRoot(root)...)
+			} else {
+				candidates = append(candidates, root)
+			}
+		} else if strings.Contains(root, string(filepath.Separator)) {
+			candidates = append(candidates, root)
+		}
+	}
+
+	home, _ := os.UserHomeDir()
+	for _, root := range linuxWindsurfInstallCandidates(home) {
+		candidates = append(candidates, linuxExecutableCandidatesFromRoot(root)...)
+	}
+	for _, name := range []string{"windsurf", "Windsurf"} {
+		if path, err := lookPathFn(name); err == nil && strings.TrimSpace(path) != "" {
+			candidates = append(candidates, path)
+		}
+	}
+
+	for _, candidate := range uniqueCandidatePaths(candidates) {
+		if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func linuxExecutableCandidatesFromRoot(root string) []string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil
+	}
+	root = filepath.Clean(root)
+	return uniqueCandidatePaths([]string{
+		root,
+		filepath.Join(root, "windsurf"),
+		filepath.Join(root, "Windsurf"),
+		filepath.Join(root, "windsurf.AppImage"),
+		filepath.Join(root, "Windsurf.AppImage"),
+		filepath.Join(root, "bin", "windsurf"),
+		filepath.Join(root, "bin", "Windsurf"),
+	})
 }
