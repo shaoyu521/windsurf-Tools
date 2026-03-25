@@ -408,15 +408,29 @@ func (r *OpenAIRelay) streamResponse(w http.ResponseWriter, body io.ReadCloser, 
 
 		// 尝试从 buf 中提取完整的 gRPC 帧
 		for len(buf) >= 5 {
-			frameLen := int(buf[1])<<24 | int(buf[2])<<16 | int(buf[3])<<8 | int(buf[4])
-			totalLen := 5 + frameLen
+			flags := buf[0]
+			envelopeLen := int(buf[1])<<24 | int(buf[2])<<16 | int(buf[3])<<8 | int(buf[4])
+			totalLen := 5 + envelopeLen
 			if len(buf) < totalLen {
 				break
 			}
-			framePayload := buf[5:totalLen]
+			framePayload := append([]byte(nil), buf[5:totalLen]...)
 			buf = buf[totalLen:]
 
-			text, isDone, err := ParseChatResponseChunk(framePayload)
+			if flags&streamEnvelopeEndStream != 0 {
+				chunk := buildSSEChunk(chatID, model, "", true)
+				fmt.Fprintf(w, "data: %s\n\n", chunk)
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+
+			decodedPayload, err := decodeStreamEnvelopePayload(flags, framePayload)
+			if err != nil {
+				continue
+			}
+
+			text, isDone, err := ParseChatResponseChunk(decodedPayload)
 			if err != nil {
 				continue
 			}

@@ -188,6 +188,53 @@ func TestParseUserStatusPayload(t *testing.T) {
 	}
 }
 
+func TestParseUserStatusPayload_MissingWeeklyDoesNotFabricateZero(t *testing.T) {
+	planInfo := pbBytes(2, []byte("Pro"))
+	plan := append([]byte{}, pbBytes(1, planInfo)...)
+	plan = append(plan, pbVarint(14, 55)...)
+	plan = append(plan, pbVarint(17, 1774080000)...)
+	plan = append(plan, pbVarint(18, 1774166400)...)
+
+	user := append([]byte{}, pbBytes(3, []byte("Pro User"))...)
+	user = append(user, pbVarint(6, 3)...)
+	user = append(user, pbBytes(7, []byte("pro@example.com"))...)
+	user = append(user, pbBytes(13, plan)...)
+
+	profile := parseUserStatusPayload(pbBytes(1, user))
+	if profile == nil {
+		t.Fatal("parseUserStatusPayload() returned nil")
+	}
+	if profile.DailyQuotaRemaining == nil || *profile.DailyQuotaRemaining != 55 {
+		t.Fatalf("DailyQuotaRemaining = %#v", profile.DailyQuotaRemaining)
+	}
+	if profile.WeeklyQuotaRemaining != nil {
+		t.Fatalf("WeeklyQuotaRemaining should stay nil when upstream omits it, got %#v", profile.WeeklyQuotaRemaining)
+	}
+}
+
+func TestParseUserStatusPayload_MissingBothMarksDailyExhaustedOnly(t *testing.T) {
+	planInfo := pbBytes(2, []byte("Trial"))
+	plan := append([]byte{}, pbBytes(1, planInfo)...)
+	plan = append(plan, pbVarint(17, 1774080000)...)
+	plan = append(plan, pbVarint(18, 1774166400)...)
+
+	user := append([]byte{}, pbBytes(3, []byte("Trial User"))...)
+	user = append(user, pbVarint(6, 9)...)
+	user = append(user, pbBytes(7, []byte("trial@example.com"))...)
+	user = append(user, pbBytes(13, plan)...)
+
+	profile := parseUserStatusPayload(pbBytes(1, user))
+	if profile == nil {
+		t.Fatal("parseUserStatusPayload() returned nil")
+	}
+	if profile.DailyQuotaRemaining == nil || *profile.DailyQuotaRemaining != 0 {
+		t.Fatalf("DailyQuotaRemaining = %#v, want 0", profile.DailyQuotaRemaining)
+	}
+	if profile.WeeklyQuotaRemaining != nil {
+		t.Fatalf("WeeklyQuotaRemaining should stay nil when upstream omits it, got %#v", profile.WeeklyQuotaRemaining)
+	}
+}
+
 func pbVarint(field int, value uint64) []byte {
 	out := encodeTestVarint(uint64(field << 3))
 	for value >= 0x80 {

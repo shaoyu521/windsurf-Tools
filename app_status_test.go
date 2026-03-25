@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 	"windsurf-tools-wails/backend/models"
@@ -117,6 +118,30 @@ func TestApplyAccountProfile(t *testing.T) {
 	}
 }
 
+func TestApplyAccountProfile_ClearsStaleQuotaSnapshotWhenOfficialValueMissing(t *testing.T) {
+	acc := &models.Account{
+		DailyRemaining:  "0.00%",
+		WeeklyRemaining: "99.00%",
+		TotalQuota:      300,
+		UsedQuota:       120,
+	}
+
+	applyAccountProfile(acc, &services.AccountProfile{
+		PlanName:             "Trial",
+		DailyQuotaRemaining:  nil,
+		WeeklyQuotaRemaining: nil,
+		TotalCredits:         0,
+		UsedCredits:          0,
+	})
+
+	if acc.DailyRemaining != "" || acc.WeeklyRemaining != "" {
+		t.Fatalf("quota snapshot should be cleared, got daily=%q weekly=%q", acc.DailyRemaining, acc.WeeklyRemaining)
+	}
+	if acc.TotalQuota != 0 || acc.UsedQuota != 0 {
+		t.Fatalf("credit snapshot should be cleared, got total=%d used=%d", acc.TotalQuota, acc.UsedQuota)
+	}
+}
+
 func TestApplyAccountProfile_PreservesLaterJWTExpiryWhenProfileLooksLikePlanStart(t *testing.T) {
 	acc := &models.Account{
 		Email:                 "trial@example.com",
@@ -159,4 +184,59 @@ func TestChoosePreferredSubscriptionExpiry_BlanksBrokenHistoricDateWithoutHint(t
 	if got := choosePreferredSubscriptionExpiry(acc, ""); got != "" {
 		t.Fatalf("choosePreferredSubscriptionExpiry() = %q, want blank for suspicious start-like date", got)
 	}
+}
+
+func TestNormalizeAccountPlanAndStatus_DowngradesExpiredPaidPlan(t *testing.T) {
+	acc := &models.Account{
+		PlanName:              "Pro",
+		Status:                "active",
+		SubscriptionExpiresAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
+	}
+
+	normalizeAccountPlanAndStatus(acc)
+
+	if acc.PlanName != "Free" {
+		t.Fatalf("PlanName = %q, want Free", acc.PlanName)
+	}
+	if acc.Status != "expired" {
+		t.Fatalf("Status = %q, want expired", acc.Status)
+	}
+}
+
+func TestNormalizeAccountPlanAndStatus_LeavesActivePaidPlan(t *testing.T) {
+	acc := &models.Account{
+		PlanName:              "Pro",
+		Status:                "active",
+		SubscriptionExpiresAt: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+	}
+
+	normalizeAccountPlanAndStatus(acc)
+
+	if acc.PlanName != "Pro" {
+		t.Fatalf("PlanName = %q, want Pro", acc.PlanName)
+	}
+	if acc.Status != "active" {
+		t.Fatalf("Status = %q, want active", acc.Status)
+	}
+}
+
+func TestApplyAccessErrorStatus(t *testing.T) {
+	t.Run("disabled team account", func(t *testing.T) {
+		acc := &models.Account{PlanName: "Enterprise", Status: "active"}
+		applyAccessErrorStatus(acc, fmt.Errorf(`Connect JWT失败(HTTP 403): {"code":"permission_denied","message":"User is disabled in Windsurf Team. Please refer to your company-specific resources for instructions to request a license."}`))
+		if acc.Status != "disabled" {
+			t.Fatalf("Status = %q, want disabled", acc.Status)
+		}
+	})
+
+	t.Run("subscription inactive downgrades to free", func(t *testing.T) {
+		acc := &models.Account{PlanName: "Pro", Status: "active"}
+		applyAccessErrorStatus(acc, fmt.Errorf(`Connect JWT失败(HTTP 403): {"code":"permission_denied","message":"subscription is not active, please contact your admin"}`))
+		if acc.Status != "expired" {
+			t.Fatalf("Status = %q, want expired", acc.Status)
+		}
+		if acc.PlanName != "Free" {
+			t.Fatalf("PlanName = %q, want Free", acc.PlanName)
+		}
+	})
 }

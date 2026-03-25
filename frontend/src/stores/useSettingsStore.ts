@@ -13,18 +13,32 @@ import {
 export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<models.Settings | null>(null)
   const isLoading = ref(true)
+  let fetchInFlight: Promise<void> | null = null
+  let lastFetchedAt = 0
 
-  const fetchSettings = async () => {
-    isLoading.value = true
-    try {
-      const data = await APIInfo.getSettings()
-      settings.value = normalizeSettings(data)
-    } catch (e) {
-      console.error('Failed to fetch settings:', e)
-      settings.value = createDefaultSettings()
-    } finally {
-      isLoading.value = false
+  const fetchSettings = async (force = false) => {
+    const now = Date.now()
+    if (!force && fetchInFlight) {
+      return fetchInFlight
     }
+    if (!force && settings.value && now-lastFetchedAt < 2500) {
+      return
+    }
+    isLoading.value = true
+    fetchInFlight = (async () => {
+      try {
+        const data = await APIInfo.getSettings()
+        settings.value = normalizeSettings(data)
+      } catch (e) {
+        console.error('Failed to fetch settings:', e)
+        settings.value = createDefaultSettings()
+      } finally {
+        lastFetchedAt = Date.now()
+        isLoading.value = false
+        fetchInFlight = null
+      }
+    })()
+    return fetchInFlight
   }
 
   const updateSettings = async (payload: models.Settings) => {

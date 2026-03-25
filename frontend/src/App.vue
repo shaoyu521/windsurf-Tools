@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Header from './components/layout/Header.vue'
 import Sidebar from './components/layout/Sidebar.vue'
 import AppFooter from './components/layout/AppFooter.vue'
@@ -20,8 +20,23 @@ import { EventsOn, WindowShow } from '../wailsjs/runtime/runtime'
 const mainView = useMainViewStore()
 const settings = useSettingsStore()
 const toolbarMode = ref(false)
+const shellReady = ref(false)
 let unToolbarEvent: (() => void) | undefined
 let unVisibilityRefresh: (() => void) | undefined
+
+const viewComponents = {
+  Dashboard,
+  Accounts,
+  Relay,
+  Settings,
+} as const
+
+type MainViewTab = keyof typeof viewComponents
+
+const activeViewComponent = computed(() => {
+  const current = mainView.activeTab as MainViewTab
+  return viewComponents[current] ?? viewComponents.Settings
+})
 
 watch(
   () => settings.settings?.show_desktop_toolbar,
@@ -37,6 +52,7 @@ onMounted(async () => {
   const accounts = useAccountStore()
   const system = useSystemStore()
   await settings.fetchSettings()
+  toolbarMode.value = settings.settings?.show_desktop_toolbar === true
 
   unToolbarEvent = EventsOn('toolbar:set', (...data: unknown[]) => {
     toolbarMode.value = Boolean(data[0])
@@ -51,7 +67,10 @@ onMounted(async () => {
     WindowShow()
   }
 
-  await Promise.all([accounts.fetchAccounts(), system.initSystemEnvironment()])
+  shellReady.value = true
+  void Promise.all([accounts.fetchAccounts(), system.initSystemEnvironment()]).catch((error) => {
+    console.error('App bootstrap background fetch failed:', error)
+  })
 
   // 从后台切回前台时刷新当前会话与号池（节流，避免频繁触发）
   let lastFocusRefresh = 0
@@ -82,7 +101,19 @@ onUnmounted(() => {
     class="flex flex-col h-full text-ios-text dark:text-ios-textDark overflow-hidden antialiased app-root"
     :class="toolbarMode ? 'bg-transparent' : ''"
   >
-    <template v-if="toolbarMode">
+    <template v-if="!shellReady">
+      <div class="flex-1 min-h-0 p-4">
+        <div
+          class="h-full rounded-[28px] backdrop-blur-2xl"
+          :class="
+            toolbarMode
+              ? 'border border-transparent bg-transparent shadow-none'
+              : 'border border-black/[0.05] bg-white/72 dark:border-white/[0.08] dark:bg-[#1C1C1E]/82'
+          "
+        />
+      </div>
+    </template>
+    <template v-else-if="toolbarMode">
       <ToolbarStrip class="flex-1 min-h-0 flex flex-col justify-center" />
     </template>
     <template v-else>
@@ -91,12 +122,9 @@ onUnmounted(() => {
         <Sidebar :activeTab="mainView.activeTab" @update:activeTab="mainView.activeTab = $event" />
         <main class="flex-1 flex flex-col min-h-0 overflow-hidden relative bg-black/[0.01] dark:bg-white/[0.01]">
           <div class="flex-1 overflow-y-auto overflow-x-hidden relative scroll-smooth min-h-0 flex flex-col">
-            <div class="flex-1 shrink-0 flex flex-col">
-              <Transition name="fade" mode="out-in">
-                <Dashboard v-if="mainView.activeTab === 'Dashboard'" />
-                <Accounts v-else-if="mainView.activeTab === 'Accounts'" />
-                <Relay v-else-if="mainView.activeTab === 'Relay'" />
-                <Settings v-else />
+            <div class="flex-1 shrink-0 flex flex-col relative">
+              <Transition name="fade">
+                <component :is="activeViewComponent" :key="mainView.activeTab" />
               </Transition>
             </div>
             <AppFooter class="mt-auto" />
@@ -112,14 +140,20 @@ onUnmounted(() => {
 <style scoped>
 .fade-enter-active,
 .fade-leave-active {
-  transition: opacity 0.28s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: opacity 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.fade-leave-active {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  pointer-events: none;
 }
 .fade-enter-from {
   opacity: 0;
-  transform: translateY(8px);
+  transform: translateY(6px);
 }
 .fade-leave-to {
   opacity: 0;
-  transform: translateY(-4px);
+  transform: translateY(-2px);
 }
 </style>

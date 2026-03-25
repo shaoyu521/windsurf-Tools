@@ -37,9 +37,13 @@ func InitDebugLogger(dataDir string, enabled bool) {
 // DLog 写一条调试日志（同时写 stdout 和文件）
 func DLog(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	log.Print(msg)
-	if globalDebugLogger != nil {
+	if globalDebugLogger != nil && globalDebugLogger.Enabled() {
+		log.Print(msg)
 		globalDebugLogger.write(msg)
+		return
+	}
+	if os.Getenv("WINDSURF_TOOLS_DEBUG_STDOUT") == "1" {
+		log.Print(msg)
 	}
 }
 
@@ -84,4 +88,13 @@ func (d *DebugLogger) write(msg string) {
 		return
 	}
 	d.logger.Printf("%s %s", time.Now().Format("15:04:05.000"), msg)
+}
+
+func (d *DebugLogger) Enabled() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.enabled
 }

@@ -23,7 +23,7 @@ import {
   Download,
 } from 'lucide-vue-next'
 import { APIInfo } from '../api/wails'
-import { getPlanTone } from '../utils/account'
+import { getPlanTone, isQuotaDepleted, isWeeklyQuotaBlocked } from '../utils/account'
 import {
   SWITCH_PLAN_FILTER_TONES,
   type SwitchPlanTone,
@@ -556,9 +556,8 @@ const getCardStateMeta = (acc: models.Account): { tone: CardStateTone; label: st
   const weekly = parseFloat(String(acc.weekly_remaining || '').replace('%', '').trim())
   const dailyKnown = Number.isFinite(daily)
   const weeklyKnown = Number.isFinite(weekly)
-  const exhausted =
-    (dailyKnown && daily <= 0) &&
-    (!weeklyKnown || weekly <= 0)
+  const weeklyBlocked = isWeeklyQuotaBlocked(acc)
+  const exhausted = isQuotaDepleted(acc)
   const lowQuota =
     (dailyKnown && daily > 0 && daily < 20) ||
     (weeklyKnown && weekly > 0 && weekly < 20)
@@ -567,6 +566,13 @@ const getCardStateMeta = (acc: models.Account): { tone: CardStateTone; label: st
     return {
       tone: 'pending',
       label: '待同步',
+    }
+  }
+
+  if (weeklyBlocked) {
+    return {
+      tone: 'danger',
+      label: '周限不可用',
     }
   }
 
@@ -1081,7 +1087,7 @@ const getPlanAccentClass = (acc: models.Account) => {
               <div class="mt-4 space-y-1.5">
                 <div class="flex items-center justify-between text-[11px] font-bold text-gray-800 dark:text-gray-200">
                   <span>周额度</span>
-                  <span>{{ acc.weekly_remaining || '—' }}</span>
+                  <span>{{ acc.weekly_remaining || (isWeeklyQuotaBlocked(acc) ? '官方缺失' : '—') }}</span>
                 </div>
                 <div class="h-2 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-white/10">
                   <div
@@ -1096,6 +1102,12 @@ const getPlanAccentClass = (acc: models.Account) => {
                   :title="formatDateTimeAsiaShanghai(acc.weekly_reset_at)"
                 >
                   {{ formatResetCountdownZH(acc.weekly_reset_at) }}
+                </div>
+                <div
+                  v-if="isWeeklyQuotaBlocked(acc)"
+                  class="pt-1 text-[10px] font-semibold text-rose-600 dark:text-rose-300"
+                >
+                  官方未返回周额度，按不可用处理
                 </div>
               </div>
             </div>

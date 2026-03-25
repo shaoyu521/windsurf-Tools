@@ -6,7 +6,7 @@ import { APIInfo } from '../api/wails'
 import { WindowShow } from '../../wailsjs/runtime/runtime'
 import { Loader2, Maximize2, RefreshCcw } from 'lucide-vue-next'
 import { formatResetCountdownZH, formatSyncTimeLine } from '../utils/datetimeAsia'
-import { getPlanLabel, parsePercent } from '../utils/account'
+import { getPlanLabel, isQuotaDepleted, isWeeklyQuotaBlocked, parsePercent } from '../utils/account'
 
 const accountStore = useAccountStore()
 const systemStore = useSystemStore()
@@ -50,7 +50,19 @@ const currentEmail = computed(() => {
 
 const planLabel = computed(() => getPlanLabel(currentAccount.value?.plan_name))
 const dailyPctText = computed(() => currentAccount.value?.daily_remaining || '待同步')
-const weeklyPctText = computed(() => currentAccount.value?.weekly_remaining || '待同步')
+const weeklyPctText = computed(() => {
+  const acc = currentAccount.value
+  if (!acc) {
+    return '待同步'
+  }
+  if (acc.weekly_remaining) {
+    return acc.weekly_remaining
+  }
+  if (isWeeklyQuotaBlocked(acc)) {
+    return '官方缺失'
+  }
+  return '待同步'
+})
 
 const normalizePercent = (value?: string) => {
   const n = parsePercent(value)
@@ -66,6 +78,9 @@ const weeklyPercent = computed(() => normalizePercent(currentAccount.value?.week
 const quotaTone = computed<'good' | 'warn' | 'danger' | 'muted'>(() => {
   if (!currentAccount.value) {
     return 'muted'
+  }
+  if (isQuotaDepleted(currentAccount.value)) {
+    return 'danger'
   }
   const candidates = [dailyPercent.value, weeklyPercent.value].filter((v) => Number.isFinite(v) && v > 0)
   const fallback = [dailyPercent.value, weeklyPercent.value].filter((v) => Number.isFinite(v))
@@ -159,10 +174,12 @@ async function refreshSnapshot(force = false) {
   }
   refreshBusy.value = true
   try {
-    await systemStore.fetchCurrentAuth()
-    await accountStore.fetchAccounts(force)
+    await Promise.all([
+      systemStore.fetchCurrentAuth(force),
+      accountStore.fetchAccounts(force),
+    ])
     const acc = currentAccount.value
-    if (acc?.id) {
+    if (force && acc?.id) {
       await APIInfo.refreshAccountQuota(acc.id)
       await accountStore.fetchAccounts(true)
     }

@@ -1,7 +1,9 @@
 package services
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,4 +213,110 @@ func TestTruncKey(t *testing.T) {
 	if got != "short" {
 		t.Fatalf("truncKey short = %q", got)
 	}
+}
+
+func TestStreamResponse_EmitsSSEChunks(t *testing.T) {
+	relay := newTestRelay()
+	secondPayload := append(encodeBytesField(1, []byte("world")), 0x10, 0x01)
+	body := io.NopCloser(strings.NewReader(string(
+		appendGRPCFrame(
+			appendGRPCFrame(nil, encodeBytesField(1, []byte("hello "))),
+			secondPayload,
+		),
+	)))
+	w := httptest.NewRecorder()
+
+	relay.streamResponse(w, body, "chat-1", "cascade")
+
+	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	out := w.Body.String()
+	if !strings.Contains(out, `"content":"hello "`) {
+		t.Fatalf("stream output missing first delta: %s", out)
+	}
+	if !strings.Contains(out, `"content":"world"`) {
+		t.Fatalf("stream output missing second delta: %s", out)
+	}
+	if !strings.Contains(out, `data: [DONE]`) {
+		t.Fatalf("stream output missing DONE marker: %s", out)
+	}
+}
+
+func TestStreamResponse_HandlesSplitFrameAcrossReads(t *testing.T) {
+	relay := newTestRelay()
+	payload := append(encodeBytesField(1, []byte("split")), 0x10, 0x01)
+	frame := appendGRPCFrame(nil, payload)
+	body := io.NopCloser(&chunkedReader{
+		chunks: [][]byte{
+			frame[:3],
+			frame[3:7],
+			frame[7:],
+		},
+	})
+	w := httptest.NewRecorder()
+
+	relay.streamResponse(w, body, "chat-2", "cascade")
+
+	out := w.Body.String()
+	if !strings.Contains(out, `"content":"split"`) {
+		t.Fatalf("stream output missing split chunk: %s", out)
+	}
+	if !strings.Contains(out, `data: [DONE]`) {
+		t.Fatalf("stream output missing DONE marker: %s", out)
+	}
+}
+
+func TestStreamResponse_HandlesCompressedConnectFrames(t *testing.T) {
+	relay := newTestRelay()
+	firstPayload := append(
+		encodeBytesField(1, []byte("bot-ignore-me")),
+		encodeBytesField(6, encodeBytesField(3, []byte("hello ")))...,
+	)
+	secondPayload := encodeBytesField(6, encodeBytesField(3, []byte("world")))
+
+	var stream []byte
+	stream = append(stream, appendStreamEnvelope(nil, streamEnvelopeCompressed, gzipBytes(t, firstPayload))...)
+	stream = append(stream, appendStreamEnvelope(nil, streamEnvelopeCompressed, gzipBytes(t, secondPayload))...)
+	stream = append(stream, appendStreamEnvelope(nil, streamEnvelopeCompressed|streamEnvelopeEndStream, gzipBytes(t, []byte(`{}`)))...)
+
+	body := io.NopCloser(strings.NewReader(string(stream)))
+	w := httptest.NewRecorder()
+
+	relay.streamResponse(w, body, "chat-compressed", "cascade")
+
+	out := w.Body.String()
+	if !strings.Contains(out, `"content":"hello "`) {
+		t.Fatalf("stream output missing compressed first delta: %s", out)
+	}
+	if !strings.Contains(out, `"content":"world"`) {
+		t.Fatalf("stream output missing compressed second delta: %s", out)
+	}
+	if strings.Contains(out, "bot-ignore-me") {
+		t.Fatalf("stream output leaked metadata string: %s", out)
+	}
+	if !strings.Contains(out, `data: [DONE]`) {
+		t.Fatalf("stream output missing DONE marker: %s", out)
+	}
+}
+
+type chunkedReader struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	return n, nil
+}
+
+func appendGRPCFrame(dst []byte, payload []byte) []byte {
+	frame := make([]byte, 5+len(payload))
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
+	copy(frame[5:], payload)
+	return append(dst, frame...)
 }

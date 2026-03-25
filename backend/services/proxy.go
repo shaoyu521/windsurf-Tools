@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"windsurf-tools-wails/backend/utils"
 )
 
 // ── 动态 DNS 解析（兼容 VPN / IP 漂移） ──
@@ -57,7 +56,9 @@ func ResolveUpstreamIP() string {
 	if resolvedIP != "" {
 		return resolvedIP // 用上次缓存
 	}
-	log.Printf("[DNS] 解析 %s 失败(%v)，回退 %s", UpstreamHost, err, UpstreamIP)
+	if err != nil {
+		log.Printf("[DNS] 解析 %s 失败(%v)，回退 %s", UpstreamHost, err, UpstreamIP)
+	}
 	return UpstreamIP
 }
 
@@ -85,6 +86,12 @@ type PoolKeyState struct {
 	RequestCount     int
 	SuccessCount     int
 	TotalExhausted   int
+}
+
+type jwtFetchCall struct {
+	done chan struct{}
+	jwt  []byte
+	err  error
 }
 
 func newPoolKeyState(apiKey string) *PoolKeyState {
@@ -154,6 +161,8 @@ type MitmProxy struct {
 	keyStates  map[string]*PoolKeyState
 	currentIdx int
 	jwtLock    sync.RWMutex
+	jwtFetchMu sync.Mutex
+	jwtFetches map[string]*jwtFetchCall
 
 	windsurfSvc    *WindsurfService    // for JWT refresh
 	logFn          func(string)        // log callback for UI
@@ -230,6 +239,7 @@ func NewMitmProxy(windsurfSvc *WindsurfService, logFn func(string), proxyURL str
 		logFn:       logFn,
 		proxyURL:    proxyURL,
 		jwtReady:    make(chan struct{}),
+		jwtFetches:  make(map[string]*jwtFetchCall),
 		stopCh:      make(chan struct{}),
 	}
 }
@@ -342,7 +352,6 @@ func (p *MitmProxy) log(format string, args ...interface{}) {
 	msg := fmt.Sprintf("[MITM] "+format, args...)
 	p.appendRecentEvent(msg)
 	log.Println(msg)
-	utils.DLog("%s", msg)
 	if p.logFn != nil {
 		p.logFn(msg)
 	}
@@ -438,14 +447,12 @@ func (p *MitmProxy) SetPoolKeys(keys []string) {
 	if len(p.poolKeys) > 0 && p.currentIdx >= 0 && p.currentIdx < len(p.poolKeys) {
 		currentKey = p.poolKeys[p.currentIdx]
 	}
-	addedKeys := make([]string, 0, len(keys))
 	previousCurrentKey := currentKey
 
 	p.poolKeys = keys
 	for _, k := range keys {
 		if _, ok := p.keyStates[k]; !ok {
 			p.keyStates[k] = newPoolKeyState(k)
-			addedKeys = append(addedKeys, k)
 		}
 	}
 	// Remove stale keys
@@ -468,8 +475,8 @@ func (p *MitmProxy) SetPoolKeys(keys []string) {
 				p.currentIdx = i
 				running := p.running
 				p.mu.Unlock()
-				if running && len(addedKeys) > 0 {
-					go p.prefetchSpecificJWTs(addedKeys, false)
+				if running {
+					go p.prefetchJWTs()
 				}
 				return
 			}
@@ -484,8 +491,8 @@ func (p *MitmProxy) SetPoolKeys(keys []string) {
 	}
 	running := p.running
 	p.mu.Unlock()
-	if running && len(addedKeys) > 0 {
-		go p.prefetchSpecificJWTs(addedKeys, false)
+	if running {
+		go p.prefetchJWTs()
 	}
 	if running && newCurrentKey != "" && newCurrentKey != previousCurrentKey {
 		p.syncCurrentAPIKeyToClient(newCurrentKey)
@@ -872,15 +879,8 @@ func (p *MitmProxy) handleRequest(req *http.Request, origHost string) {
 	ct := req.Header.Get("Content-Type")
 	isProto := strings.Contains(strings.ToLower(ct), "proto") || strings.Contains(strings.ToLower(ct), "grpc")
 
-	// ★ 全量流量记录
-	trafficLog("REQ  %s %s (host=%s ct=%s cl=%d)", req.Method, path, origHost, ct, req.ContentLength)
-	// 记录 Authorization header（截断）用于诊断身份替换问题
-	if strings.Contains(path, "GetUserStatus") || strings.Contains(path, "GetUserJwt") {
-		auth := req.Header.Get("Authorization")
-		if len(auth) > 50 {
-			auth = auth[:50] + "..."
-		}
-		trafficLog("  AUTH: %s", auth)
+	if shouldCaptureTrafficPath(path) {
+		trafficLog("REQ  %s %s (host=%s ct=%s cl=%d)", req.Method, path, origHost, ct, req.ContentLength)
 	}
 
 	if !isProto {
@@ -943,18 +943,13 @@ func (p *MitmProxy) handleResponse(resp *http.Response) {
 		pathTail = path[idx+1:]
 	}
 
-	// ★ 全量流量记录（所有响应都记）
 	respCT := resp.Header.Get("Content-Type")
 	grpcSt := resp.Header.Get("grpc-status")
-	trafficLog("RESP %s %s → %d (ct=%s cl=%d grpc-status=%s)", resp.Request.Method, path, resp.StatusCode, respCT, resp.ContentLength, grpcSt)
+	if shouldCaptureTrafficPath(path) {
+		trafficLog("RESP %s %s → %d (ct=%s cl=%d grpc-status=%s)", resp.Request.Method, path, resp.StatusCode, respCT, resp.ContentLength, grpcSt)
+	}
 
-	// 对额度/套餐相关路径 dump 响应体
-	isQuotaPath := strings.Contains(path, "PlanStatus") || strings.Contains(path, "UserStatus") ||
-		strings.Contains(path, "GetUser") || strings.Contains(path, "RegisterUser") ||
-		strings.Contains(path, "Subscription") || strings.Contains(path, "quota") ||
-		strings.Contains(path, "Credit") || strings.Contains(path, "Billing") ||
-		strings.Contains(path, "SeatManagement") || strings.Contains(path, "CurrentUser")
-	if isQuotaPath && resp.Body != nil && resp.ContentLength < 500000 {
+	if shouldCaptureTrafficPath(path) && resp.Body != nil && resp.ContentLength < 500000 {
 		bodySnap, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err == nil && len(bodySnap) > 0 {
@@ -1046,6 +1041,22 @@ func (p *MitmProxy) handleResponse(resp *http.Response) {
 					p.log("★ 流式额度耗尽立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
 				}
 			}, func() {
+				gs := resp.Trailer.Get("grpc-status")
+				gm := resp.Trailer.Get("grpc-message")
+				kind, detail := classifyUpstreamFailure(gs, gm, "")
+				if kind == upstreamFailureQuota {
+					p.log("流式 trailer 额度耗尽: %s key=%s...", pathTail, usedKey[:minStr(12, len(usedKey))])
+					rotatedKey := p.markRuntimeExhaustedAndRotate(usedKey, detail)
+					if rotatedKey != "" {
+						p.log("★ 流式 trailer 额度耗尽立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
+					}
+					return
+				}
+				if kind != upstreamFailureNone {
+					p.recordUpstreamFailure(kind, detail, usedKey)
+					p.log("流式上游%s错误: %s key=%s...", kind.logLabel(), detail, usedKey[:minStr(12, len(usedKey))])
+					return
+				}
 				p.mu.Lock()
 				if state := p.keyStates[usedKey]; state != nil {
 					state.recordSuccess()
@@ -1254,44 +1265,96 @@ func (p *MitmProxy) jwtBytesForKey(apiKey string) []byte {
 	return jwt
 }
 
-func (p *MitmProxy) ensureJWTForKey(apiKey string) []byte {
-	if apiKey == "" || p.windsurfSvc == nil || !strings.HasPrefix(apiKey, "sk-ws-") {
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
 		return nil
 	}
-	if jwt := p.jwtBytesForKey(apiKey); len(jwt) > 0 {
-		return jwt
-	}
-	jwt, err := getJWTByAPIKeyFn(p.windsurfSvc, apiKey)
-	if err != nil {
-		p.log("JWT 按需获取失败: %s... (%v)", apiKey[:minStr(12, len(apiKey))], err)
-		return nil
-	}
-	out := []byte(jwt)
-	p.updateJWT(apiKey, out)
-	p.jwtOnce.Do(func() {
-		close(p.jwtReady)
-	})
-	p.log("JWT 按需获取成功: %s... (%dB)", apiKey[:minStr(12, len(apiKey))], len(out))
+	out := make([]byte, len(src))
+	copy(out, src)
 	return out
 }
 
-func (p *MitmProxy) refreshJWTForKey(apiKey string) []byte {
+func (p *MitmProxy) markJWTReady() {
+	p.jwtOnce.Do(func() {
+		close(p.jwtReady)
+	})
+}
+
+func (p *MitmProxy) beginJWTFetch(apiKey string, force bool) (*jwtFetchCall, []byte, bool) {
+	p.jwtFetchMu.Lock()
+	if call := p.jwtFetches[apiKey]; call != nil {
+		p.jwtFetchMu.Unlock()
+		return call, nil, false
+	}
+	if !force {
+		if jwt := p.jwtBytesForKey(apiKey); len(jwt) > 0 {
+			p.jwtFetchMu.Unlock()
+			return nil, jwt, false
+		}
+	}
+	call := &jwtFetchCall{done: make(chan struct{})}
+	p.jwtFetches[apiKey] = call
+	p.jwtFetchMu.Unlock()
+	return call, nil, true
+}
+
+func (p *MitmProxy) finishJWTFetch(apiKey string, call *jwtFetchCall, jwt []byte, err error) {
+	p.jwtFetchMu.Lock()
+	call.jwt = cloneBytes(jwt)
+	call.err = err
+	delete(p.jwtFetches, apiKey)
+	close(call.done)
+	p.jwtFetchMu.Unlock()
+}
+
+func (p *MitmProxy) waitJWTFetch(call *jwtFetchCall) []byte {
+	<-call.done
+	return cloneBytes(call.jwt)
+}
+
+func (p *MitmProxy) fetchJWTForKey(apiKey string, force bool) []byte {
 	if apiKey == "" || p.windsurfSvc == nil || !strings.HasPrefix(apiKey, "sk-ws-") {
 		return nil
 	}
-	p.clearJWT(apiKey)
+	call, cached, leader := p.beginJWTFetch(apiKey, force)
+	if len(cached) > 0 {
+		p.markJWTReady()
+		return cached
+	}
+	if !leader {
+		return p.waitJWTFetch(call)
+	}
+	if force {
+		p.clearJWT(apiKey)
+	}
 	jwt, err := getJWTByAPIKeyFn(p.windsurfSvc, apiKey)
 	if err != nil {
-		p.log("JWT 强制刷新失败: %s... (%v)", apiKey[:minStr(12, len(apiKey))], err)
+		p.finishJWTFetch(apiKey, call, nil, err)
+		if force {
+			p.log("JWT 强制刷新失败: %s... (%v)", apiKey[:minStr(12, len(apiKey))], err)
+		} else {
+			p.log("JWT 按需获取失败: %s... (%v)", apiKey[:minStr(12, len(apiKey))], err)
+		}
 		return nil
 	}
 	out := []byte(jwt)
 	p.updateJWT(apiKey, out)
-	p.jwtOnce.Do(func() {
-		close(p.jwtReady)
-	})
-	p.log("JWT 强制刷新成功: %s... (%dB)", apiKey[:minStr(12, len(apiKey))], len(out))
-	return out
+	p.markJWTReady()
+	p.finishJWTFetch(apiKey, call, out, nil)
+	if force {
+		p.log("JWT 强制刷新成功: %s... (%dB)", apiKey[:minStr(12, len(apiKey))], len(out))
+	} else {
+		p.log("JWT 按需获取成功: %s... (%dB)", apiKey[:minStr(12, len(apiKey))], len(out))
+	}
+	return cloneBytes(out)
+}
+
+func (p *MitmProxy) ensureJWTForKey(apiKey string) []byte {
+	return p.fetchJWTForKey(apiKey, false)
+}
+
+func (p *MitmProxy) refreshJWTForKey(apiKey string) []byte {
+	return p.fetchJWTForKey(apiKey, true)
 }
 
 func (p *MitmProxy) prefetchSpecificJWTs(keys []string, force bool) {
@@ -1313,11 +1376,39 @@ func (p *MitmProxy) prefetchSpecificJWTs(keys []string, force bool) {
 }
 
 func (p *MitmProxy) prefetchJWTs() {
-	p.mu.RLock()
-	keys := make([]string, len(p.poolKeys))
-	copy(keys, p.poolKeys)
-	p.mu.RUnlock()
+	keys := p.jwtRefreshKeys()
+	if len(keys) == 0 {
+		return
+	}
+	if len(p.jwtBytesForKey(keys[0])) > 0 {
+		p.markJWTReady()
+		return
+	}
 	p.prefetchSpecificJWTs(keys, false)
+}
+
+func (p *MitmProxy) jwtRefreshKeys() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.poolKeys) == 0 || p.currentIdx < 0 || p.currentIdx >= len(p.poolKeys) {
+		return nil
+	}
+	key := p.poolKeys[p.currentIdx]
+	if key == "" {
+		return nil
+	}
+	if state := p.keyStates[key]; state != nil && state.RuntimeExhausted {
+		return nil
+	}
+	return []string{key}
+}
+
+func (p *MitmProxy) refreshJWTsOnce() {
+	keys := p.jwtRefreshKeys()
+	if len(keys) == 0 {
+		return
+	}
+	p.prefetchSpecificJWTs(keys, true)
 }
 
 func (p *MitmProxy) jwtRefreshLoop() {
@@ -1329,19 +1420,8 @@ func (p *MitmProxy) jwtRefreshLoop() {
 		case <-p.stopCh:
 			return
 		case <-ticker.C:
-			p.log("定时刷新 JWT...")
-			p.mu.RLock()
-			var keys []string
-			for _, k := range p.poolKeys {
-				if state := p.keyStates[k]; state != nil && state.RuntimeExhausted {
-					continue // 跳过已耗尽的 key，节省 API 调用
-				}
-				keys = append(keys, k)
-			}
-			p.mu.RUnlock()
-			if len(keys) > 0 {
-				p.prefetchSpecificJWTs(keys, true)
-			}
+			p.log("定时刷新当前 key 的 JWT...")
+			p.refreshJWTsOnce()
 		}
 	}
 }

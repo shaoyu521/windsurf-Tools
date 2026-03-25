@@ -15,7 +15,7 @@ import (
 func (a *App) GetAllAccounts() []models.Account {
 	accounts := a.store.GetAllAccounts()
 	for i := range accounts {
-		accounts[i].SubscriptionExpiresAt = choosePreferredSubscriptionExpiry(&accounts[i], "")
+		normalizeAccountPlanAndStatus(&accounts[i])
 	}
 	return accounts
 }

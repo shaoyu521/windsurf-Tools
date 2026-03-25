@@ -2,6 +2,13 @@ import type { Account, HealthFilter, PlanFilter } from '../types/windsurf'
 
 type HealthTone = Exclude<HealthFilter, 'all'>
 type PlanTone = Exclude<PlanFilter, 'all'>
+type QuotaAccountLike = {
+  daily_remaining?: string | null
+  weekly_remaining?: string | null
+  weekly_reset_at?: string | null
+  total_quota?: number | null
+  used_quota?: number | null
+}
 
 const DASH = '—'
 const ASIA_SHANGHAI = 'Asia/Shanghai'
@@ -82,7 +89,10 @@ export function parsePercent(value?: string): number | null {
   return Number.isFinite(numeric) ? numeric : null
 }
 
-export function getMonthlyRemaining(account: Account): number | null {
+export function getMonthlyRemaining(account?: QuotaAccountLike | null): number | null {
+  if (!account) {
+    return null
+  }
   const total = account.total_quota ?? 0
   if (total <= 0) {
     return null
@@ -93,7 +103,54 @@ export function getMonthlyRemaining(account: Account): number | null {
   return (remaining / total) * 100
 }
 
+export function isWeeklyQuotaBlocked(account?: QuotaAccountLike | null): boolean {
+  if (!account) {
+    return false
+  }
+
+  if ((account.weekly_remaining || '').trim()) {
+    return false
+  }
+  if (!(account.weekly_reset_at || '').trim()) {
+    return false
+  }
+
+  const daily = parsePercent(account.daily_remaining || undefined)
+  if (daily !== null && daily <= 0) {
+    return false
+  }
+
+  return true
+}
+
+export function isQuotaDepleted(account?: QuotaAccountLike | null): boolean {
+  if (!account) {
+    return false
+  }
+
+  const monthly = getMonthlyRemaining(account)
+  if (monthly !== null && monthly <= 0) {
+    return true
+  }
+
+  const daily = parsePercent(account.daily_remaining || undefined)
+  if (daily !== null && daily <= 0) {
+    return true
+  }
+
+  const weekly = parsePercent(account.weekly_remaining || undefined)
+  if (weekly !== null && weekly <= 0) {
+    return true
+  }
+
+  return isWeeklyQuotaBlocked(account)
+}
+
 export function getLowestRemaining(account: Account): number | null {
+  if (isWeeklyQuotaBlocked(account)) {
+    return 0
+  }
+
   const candidates = [
     parsePercent(account.daily_remaining),
     parsePercent(account.weekly_remaining),

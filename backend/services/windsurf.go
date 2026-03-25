@@ -594,7 +594,6 @@ func parsePlanStatusPayload(ps planStatusPayload) *AccountProfile {
 	if ps.UsedUsageCredits != nil {
 		usedUsage = *ps.UsedUsageCredits
 	}
-	hasUsageData := ps.UsedPromptCredits != nil || ps.UsedUsageCredits != nil
 	used := creditsToUnits(usedPrompt) + creditsToUnits(usedUsage)
 	profile.TotalCredits = total
 	profile.UsedCredits = used
@@ -607,22 +606,6 @@ func parsePlanStatusPayload(ps planStatusPayload) *AccountProfile {
 
 	if profile.PlanName == "" {
 		profile.PlanName = "Free"
-	}
-	// API 不传日/周百分比时，仅在 credits 系统确实追踪了用量（used>0）时才合成百分比
-	// Pro/Teams 的 Cascade 用量不走 credits，used 始终为 0，此时不合成，避免永远显示 100%
-	if profile.DailyQuotaRemaining == nil && profile.WeeklyQuotaRemaining == nil && hasUsageData && used > 0 {
-		if total == 0 {
-			z := 0.0
-			profile.DailyQuotaRemaining = &z
-			profile.WeeklyQuotaRemaining = &z
-		} else {
-			pct := float64(total-used) / float64(total) * 100
-			if pct < 0 {
-				pct = 0
-			}
-			profile.DailyQuotaRemaining = &pct
-			profile.WeeklyQuotaRemaining = &pct
-		}
 	}
 	return profile
 }
@@ -676,32 +659,18 @@ func parseUserStatusPayload(payload []byte) *AccountProfile {
 			profile.WeeklyQuotaRemaining = &v
 		}
 		// ★ 服务端在配额用尽时会省略 F14/F15 字段（不是返回0）。
-		// 规则：
-		//   1) 仅一侧存在 → 缺失的另一侧 = 0%（用尽）
-		//   2) 两侧都不存在但有 resetAt → 也视为 0%（全部用尽）
-		//   3) 两侧都不存在且无 resetAt → 积分制套餐，尝试从 credits 合成
+		// 当前只把「缺失的日额度」视为 0%，因为日限见底需要尽快切号；
+		// 周额度缺失时不再伪造，避免把“周额度未知”误判成“周额度耗尽”。
 		hasResetAt := f17Val > 0 || f18Val > 0
-		if hasF14 && !hasF15 {
-			zero := 0.0
-			profile.WeeklyQuotaRemaining = &zero
-		}
 		if hasF15 && !hasF14 {
 			zero := 0.0
 			profile.DailyQuotaRemaining = &zero
 		}
 		if !hasF14 && !hasF15 && hasResetAt {
-			// 有 resetAt 说明是日/周配额制套餐（Pro/Trial），两者都被省略 = 全部用尽
+			// 有 resetAt 说明是日/周配额制套餐（Pro/Trial），两者都省略时至少视为日额度已见底。
+			// 周额度保持未知，等待后续官方刷新返回真实值。
 			zero := 0.0
 			profile.DailyQuotaRemaining = &zero
-			profile.WeeklyQuotaRemaining = &zero
-		}
-		if profile.DailyQuotaRemaining == nil && profile.WeeklyQuotaRemaining == nil && profile.TotalCredits > 0 && profile.UsedCredits > 0 {
-			pct := float64(profile.TotalCredits-profile.UsedCredits) / float64(profile.TotalCredits) * 100
-			if pct < 0 {
-				pct = 0
-			}
-			profile.DailyQuotaRemaining = &pct
-			profile.WeeklyQuotaRemaining = &pct
 		}
 		if planEnd := subscriptionEndFromPlanProto(plan); planEnd != "" {
 			profile.SubscriptionExpiresAt = planEnd

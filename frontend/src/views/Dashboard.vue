@@ -22,7 +22,7 @@ import {
   RefreshCcw,
 } from 'lucide-vue-next'
 import { showToast } from '../utils/toast'
-import { getPlanTone } from '../utils/account'
+import { getPlanTone, isQuotaDepleted, parsePercent } from '../utils/account'
 import { SWITCH_PLAN_FILTER_TONES, switchPlanFilterToneOptions, type SwitchPlanTone } from '../utils/settingsModel'
 import { PLAN_TONE_CHART_COLORS } from '../utils/planToneChart'
 
@@ -234,26 +234,28 @@ const handleRefreshAllTokens = async () => {
 // Setup KPIs
 const totalAccounts = computed(() => accountStore.accounts.length)
 
-const parseQuota = (str: string | undefined | null) => {
-  if (!str) return null
-  const n = parseFloat(String(str).replace('%', '').trim())
-  return Number.isFinite(n) ? n : null
+const isQuotaDepletedAccount = (account: {
+  daily_remaining?: string | null
+  weekly_remaining?: string | null
+  weekly_reset_at?: string | null
+  total_quota?: number | null
+  used_quota?: number | null
+}) => {
+  return isQuotaDepleted(account)
 }
 
-const isQuotaDepletedAccount = (account: { daily_remaining?: string | null; weekly_remaining?: string | null }) => {
-  const daily = parseQuota(account.daily_remaining)
-  const weekly = parseQuota(account.weekly_remaining)
-  const dailyKnown = daily !== null
-  const weeklyKnown = weekly !== null
-  return Boolean(dailyKnown && daily <= 0 && (!weeklyKnown || (weekly ?? 0) <= 0))
-}
-
-const isLowQuotaAccount = (account: { daily_remaining?: string | null; weekly_remaining?: string | null }) => {
+const isLowQuotaAccount = (account: {
+  daily_remaining?: string | null
+  weekly_remaining?: string | null
+  weekly_reset_at?: string | null
+  total_quota?: number | null
+  used_quota?: number | null
+}) => {
   if (isQuotaDepletedAccount(account)) {
     return false
   }
-  const daily = parseQuota(account.daily_remaining)
-  const weekly = parseQuota(account.weekly_remaining)
+  const daily = parsePercent(account.daily_remaining || undefined)
+  const weekly = parsePercent(account.weekly_remaining || undefined)
   return Boolean(
     (daily !== null && daily > 0 && daily < 20) ||
       (weekly !== null && weekly > 0 && weekly < 20),
@@ -270,7 +272,7 @@ const normalCount = computed(() => {
 })
 
 const avgQuota = computed(() => {
-  const valid = accountStore.accounts.map(a => parseQuota(a.daily_remaining)).filter(q => q !== null) as number[]
+  const valid = accountStore.accounts.map(a => parsePercent(a.daily_remaining)).filter(q => q !== null) as number[]
   if (valid.length === 0) return '0%'
   const sum = valid.reduce((acc, curr) => acc + curr, 0)
   return Math.round(sum / valid.length) + '%'

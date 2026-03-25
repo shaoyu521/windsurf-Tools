@@ -1,7 +1,10 @@
 package services
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -46,6 +49,27 @@ func TestExtractGRPCFrames(t *testing.T) {
 	}
 }
 
+func TestExtractGRPCFrames_DecodesCompressedConnectFrames(t *testing.T) {
+	frame1 := encodeBytesField(6, encodeBytesField(3, []byte("hello ")))
+	frame2 := encodeBytesField(6, encodeBytesField(3, []byte("world")))
+
+	var stream []byte
+	stream = append(stream, appendStreamEnvelope(nil, streamEnvelopeCompressed, gzipBytes(t, frame1))...)
+	stream = append(stream, appendStreamEnvelope(nil, streamEnvelopeCompressed, gzipBytes(t, frame2))...)
+	stream = append(stream, appendStreamEnvelope(nil, streamEnvelopeEndStream, []byte(`{}`))...)
+
+	frames := ExtractGRPCFrames(stream)
+	if len(frames) != 2 {
+		t.Fatalf("got %d decoded frames, want 2", len(frames))
+	}
+	if string(frames[0]) != string(frame1) {
+		t.Fatalf("decoded frame[0] mismatch")
+	}
+	if string(frames[1]) != string(frame2) {
+		t.Fatalf("decoded frame[1] mismatch")
+	}
+}
+
 func TestExtractGRPCFramesTruncated(t *testing.T) {
 	frame := []byte{0x0a, 0x02, 0x68, 0x69}
 	envelope := WrapGRPCEnvelope(frame)
@@ -55,6 +79,24 @@ func TestExtractGRPCFramesTruncated(t *testing.T) {
 	frames := ExtractGRPCFrames(truncated)
 	if len(frames) != 0 {
 		t.Fatalf("got %d frames from truncated data, want 0", len(frames))
+	}
+}
+
+func TestParseChatResponseChunk_PrefersNestedContentField(t *testing.T) {
+	payload := append(
+		encodeBytesField(1, []byte("bot-123")),
+		encodeBytesField(6, encodeBytesField(3, []byte("hello from nested content")))...,
+	)
+
+	text, isDone, err := ParseChatResponseChunk(payload)
+	if err != nil {
+		t.Fatalf("ParseChatResponseChunk error = %v", err)
+	}
+	if isDone {
+		t.Fatal("isDone = true, want false")
+	}
+	if text != "hello from nested content" {
+		t.Fatalf("text = %q", text)
 	}
 }
 
@@ -183,4 +225,29 @@ func TestEncodeBytesFieldRoundTrip(t *testing.T) {
 	if string(fields[0].Bytes) != "test payload" {
 		t.Fatalf("field bytes = %q, want %q", string(fields[0].Bytes), "test payload")
 	}
+}
+
+func appendStreamEnvelope(dst []byte, flags byte, payload []byte) []byte {
+	frame := make([]byte, 5+len(payload))
+	frame[0] = flags
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
+	copy(frame[5:], payload)
+	return append(dst, frame...)
+}
+
+func gzipBytes(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(payload); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	compressed, err := io.ReadAll(&buf)
+	if err != nil {
+		t.Fatalf("read gzip buffer: %v", err)
+	}
+	return compressed
 }

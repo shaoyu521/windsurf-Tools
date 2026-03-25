@@ -54,6 +54,7 @@ func (a *App) enrichAccountQuotaOnlyWithService(svc *services.WindsurfService, a
 		} else {
 			utils.DLog("[enrich] %s GetUserStatus 失败: %v", label, err)
 			log.Printf("[enrich] %s GetUserStatus 失败: %v", label, err)
+			applyAccessErrorStatus(acc, err)
 			needJSONFallback = true // gRPC 完全失败也尝试 JSON
 		}
 	} else {
@@ -170,15 +171,19 @@ func (a *App) enrichAccountInfoWithService(svc *services.WindsurfService, acc *m
 	}
 
 	if acc.Token != "" && (acc.RefreshToken != "" || acc.Password != "") {
-		if email, err := svc.GetAccountInfo(acc.Token); err == nil && email != "" {
-			acc.Email = email
-			utils.DLog("[enrichFull] %s GetAccountInfo: email=%s", label, email)
+		if acc.Email == "" {
+			if email, err := svc.GetAccountInfo(acc.Token); err == nil && email != "" {
+				acc.Email = email
+				utils.DLog("[enrichFull] %s GetAccountInfo: email=%s", label, email)
+			}
 		}
-		if reg, err := svc.RegisterUser(acc.Token); err == nil && reg != nil && reg.APIKey != "" {
-			acc.WindsurfAPIKey = reg.APIKey
-			utils.DLog("[enrichFull] %s RegisterUser: 获得APIKey=%s...", label, reg.APIKey[:min(12, len(reg.APIKey))])
-		} else if err != nil {
-			utils.DLog("[enrichFull] %s RegisterUser 失败: %v", label, err)
+		if strings.TrimSpace(acc.WindsurfAPIKey) == "" {
+			if reg, err := svc.RegisterUser(acc.Token); err == nil && reg != nil && reg.APIKey != "" {
+				acc.WindsurfAPIKey = reg.APIKey
+				utils.DLog("[enrichFull] %s RegisterUser: 获得APIKey=%s...", label, reg.APIKey[:min(12, len(reg.APIKey))])
+			} else if err != nil {
+				utils.DLog("[enrichFull] %s RegisterUser 失败: %v", label, err)
+			}
 		}
 	}
 
@@ -196,6 +201,7 @@ func (a *App) enrichAccountInfoWithService(svc *services.WindsurfService, acc *m
 		} else {
 			utils.DLog("[enrichFull] %s GetUserStatus 失败: %v", label, err)
 			log.Printf("[enrich] %s GetUserStatus 失败: %v", label, err)
+			applyAccessErrorStatus(acc, err)
 			needJSONFallback = true
 		}
 	} else {
@@ -266,6 +272,7 @@ func applyJWTClaims(acc *models.Account, claims *services.JWTClaims) {
 	if claims.TrialEnd != "" {
 		acc.SubscriptionExpiresAt = choosePreferredSubscriptionExpiry(acc, claims.TrialEnd)
 	}
+	normalizeAccountPlanAndStatus(acc)
 }
 
 func applyAccountProfile(acc *models.Account, profile *services.AccountProfile) {
@@ -281,25 +288,28 @@ func applyAccountProfile(acc *models.Account, profile *services.AccountProfile) 
 	if profile.PlanName != "" {
 		acc.PlanName = profile.PlanName
 	}
-	if profile.TotalCredits > 0 || profile.UsedCredits > 0 {
-		acc.TotalQuota = profile.TotalCredits
-		acc.UsedQuota = profile.UsedCredits
-	}
+	// 额度字段完全以本次官方响应为准，避免沿用旧快照。
+	acc.TotalQuota = profile.TotalCredits
+	acc.UsedQuota = profile.UsedCredits
 	if profile.DailyQuotaRemaining != nil {
 		acc.DailyRemaining = formatQuotaPercent(*profile.DailyQuotaRemaining)
+	} else {
+		acc.DailyRemaining = ""
 	}
 	if profile.WeeklyQuotaRemaining != nil {
 		acc.WeeklyRemaining = formatQuotaPercent(*profile.WeeklyQuotaRemaining)
+	} else {
+		acc.WeeklyRemaining = ""
 	}
-	// 与界面约定一致：日额度每日东八区 16:00；周期额度周末东八区 16:00（不沿用接口里易混淆的 unix）
-	now := time.Now()
-	acc.DailyResetAt = utils.NextDailyQuotaResetRFC3339(now)
-	acc.WeeklyResetAt = utils.NextWeekendQuotaResetRFC3339(now)
+	// 优先使用官方接口返回的 resetAt；缺失时保持为空，不再伪造周额度/周重置时间。
+	acc.DailyResetAt = strings.TrimSpace(profile.DailyResetAt)
+	acc.WeeklyResetAt = strings.TrimSpace(profile.WeeklyResetAt)
 	if preferred := choosePreferredSubscriptionExpiry(acc, profile.SubscriptionExpiresAt); preferred != "" {
 		acc.SubscriptionExpiresAt = preferred
 	} else {
 		acc.SubscriptionExpiresAt = ""
 	}
+	normalizeAccountPlanAndStatus(acc)
 }
 
 func choosePreferredSubscriptionExpiry(acc *models.Account, candidate string) string {
@@ -321,6 +331,58 @@ func choosePreferredSubscriptionExpiry(acc *models.Account, candidate string) st
 		return hint
 	}
 	return ""
+}
+
+func normalizeAccountPlanAndStatus(acc *models.Account) {
+	if acc == nil {
+		return
+	}
+	acc.SubscriptionExpiresAt = choosePreferredSubscriptionExpiry(acc, "")
+	status := strings.TrimSpace(strings.ToLower(acc.Status))
+	if status == "" {
+		status = "active"
+	}
+	if status == "disabled" {
+		acc.Status = "disabled"
+		return
+	}
+	if acc.SubscriptionExpiresAt == "" {
+		acc.Status = status
+		return
+	}
+	t, ok := parseSubscriptionEndTime(acc.SubscriptionExpiresAt)
+	if !ok {
+		acc.Status = status
+		return
+	}
+	if !t.After(time.Now()) {
+		acc.Status = "expired"
+		if utils.PlanTone(acc.PlanName) != "free" {
+			acc.PlanName = "Free"
+		}
+		return
+	}
+	acc.Status = "active"
+}
+
+func applyAccessErrorStatus(acc *models.Account, err error) {
+	if acc == nil || err == nil {
+		return
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(lower, "user is disabled in windsurf team"):
+		acc.Status = "disabled"
+	case strings.Contains(lower, "subscription is not active"):
+		acc.Status = "expired"
+		if utils.PlanTone(acc.PlanName) != "free" {
+			acc.PlanName = "Free"
+		}
+	case strings.Contains(lower, `"code":"permission_denied"`), strings.Contains(lower, "permission denied"):
+		if strings.TrimSpace(strings.ToLower(acc.Status)) == "" {
+			acc.Status = "disabled"
+		}
+	}
 }
 
 func manualSubscriptionExpiryHint(acc *models.Account) string {

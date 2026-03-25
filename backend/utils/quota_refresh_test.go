@@ -3,6 +3,7 @@ package utils
 import (
 	"testing"
 	"time"
+	"windsurf-tools-wails/backend/models"
 )
 
 func TestQuotaRefreshDueEmptyLast(t *testing.T) {
@@ -64,5 +65,70 @@ func TestClampQuotaCustomIntervalMinutes(t *testing.T) {
 	}
 	if ClampQuotaCustomIntervalMinutes(20000) != 10080 {
 		t.Fatal("above 7d should clamp")
+	}
+}
+
+func TestQuotaRefreshDueAfterOfficialReset_DailyReached(t *testing.T) {
+	now := time.Date(2026, 3, 25, 8, 5, 0, 0, time.UTC)
+	acc := models.Account{
+		DailyRemaining:  "0.00%",
+		DailyResetAt:    "2026-03-25T08:00:00Z",
+		LastQuotaUpdate: "2026-03-25T07:30:00Z",
+	}
+	if !QuotaRefreshDueAfterOfficialReset(acc, now) {
+		t.Fatal("expected official daily reset to force refresh")
+	}
+}
+
+func TestQuotaRefreshDueAfterOfficialReset_WeeklyMissingReachedForces(t *testing.T) {
+	now := time.Date(2026, 3, 25, 8, 5, 0, 0, time.UTC)
+	acc := models.Account{
+		DailyRemaining:  "65.00%",
+		WeeklyRemaining: "",
+		WeeklyResetAt:   "2026-03-25T08:00:00Z",
+		LastQuotaUpdate: "2026-03-25T07:30:00Z",
+	}
+	if !QuotaRefreshDueAfterOfficialReset(acc, now) {
+		t.Fatal("missing weekly quota after official reset should force refresh")
+	}
+}
+
+func TestQuotaRefreshDueAfterOfficialReset_WeeklyMissingBeforeResetDoesNotForce(t *testing.T) {
+	now := time.Date(2026, 3, 25, 7, 55, 0, 0, time.UTC)
+	acc := models.Account{
+		DailyRemaining:  "65.00%",
+		WeeklyRemaining: "",
+		WeeklyResetAt:   "2026-03-25T08:00:00Z",
+		LastQuotaUpdate: "2026-03-25T07:30:00Z",
+	}
+	if QuotaRefreshDueAfterOfficialReset(acc, now) {
+		t.Fatal("missing weekly quota before official reset should not force refresh")
+	}
+}
+
+func TestNextQuotaResetWakeDelayForExhausted(t *testing.T) {
+	now := time.Date(2026, 3, 25, 8, 0, 0, 0, time.UTC)
+	base := 30 * time.Second
+	acc := models.Account{
+		DailyRemaining: "0.00%",
+		DailyResetAt:   "2026-03-25T08:00:10Z",
+	}
+	got := NextQuotaResetWakeDelayForExhausted(acc, now, base)
+	if got != 10*time.Second {
+		t.Fatalf("NextQuotaResetWakeDelayForExhausted = %v, want 10s", got)
+	}
+}
+
+func TestNextQuotaResetWakeDelayForMissingWeeklyBlockedUsage(t *testing.T) {
+	now := time.Date(2026, 3, 25, 8, 0, 0, 0, time.UTC)
+	base := 30 * time.Second
+	acc := models.Account{
+		DailyRemaining:  "100.00%",
+		WeeklyRemaining: "",
+		WeeklyResetAt:   "2026-03-25T08:00:12Z",
+	}
+	got := NextQuotaResetWakeDelayForExhausted(acc, now, base)
+	if got != 12*time.Second {
+		t.Fatalf("NextQuotaResetWakeDelayForExhausted = %v, want 12s", got)
 	}
 }

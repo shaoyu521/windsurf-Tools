@@ -59,7 +59,7 @@ func (a *App) initBackend() error {
 	// ── 调试日志 ──
 	utils.InitDebugLogger(s.DataDir(), settings.DebugLog)
 	a.mitmProxy = services.NewMitmProxy(a.windsurfSvc, func(msg string) {
-		utils.DLog("[MITM] %s", msg)
+		utils.DLog("%s", msg)
 	}, proxyURL)
 	a.mitmProxy.SetOnKeyExhausted(func(apiKey string) {
 		utils.DLog("[回调] onKeyExhausted 触发: key=%s...", apiKey[:min(12, len(apiKey))])
@@ -92,7 +92,7 @@ func (a *App) initBackend() error {
 		}
 	})
 	a.openaiRelay = services.NewOpenAIRelay(a.mitmProxy, func(msg string) {
-		utils.DLog("[Relay] %s", msg)
+		utils.DLog("%s", msg)
 	}, proxyURL)
 	a.openaiRelay.SetOnSuccess(func(apiKey string) {
 		accounts := a.store.GetAllAccounts()

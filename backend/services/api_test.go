@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +15,33 @@ import (
 	"golang.org/x/net/http2"
 )
 
-const (
-	testEmail    = "2riyduna7@yinxuan.icu"
-	testPassword = "2riyduna7@yinxuan.icu"
+var (
+	testEmail    = strings.TrimSpace(os.Getenv("WS_TEST_EMAIL"))
+	testPassword = os.Getenv("WS_TEST_PASSWORD")
 )
+
+func requireIntegrationEnv(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping live integration tests in short mode")
+	}
+	if os.Getenv("WS_LIVE_INTEGRATION") != "1" {
+		t.Skip("set WS_LIVE_INTEGRATION=1 to run backend/services live integration tests")
+	}
+}
+
+func requireLiveCredentials(t *testing.T) {
+	t.Helper()
+	requireIntegrationEnv(t)
+	if testEmail == "" || testPassword == "" {
+		t.Skip("WS_TEST_EMAIL or WS_TEST_PASSWORD is not set")
+	}
+}
 
 // ═══ Step 1: Login ═══
 
 func TestLogin(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	resp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -36,6 +56,7 @@ func TestLogin(t *testing.T) {
 // ═══ Step 2: Login → JWT Claims ═══
 
 func TestLoginAndDecodeJWT(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	resp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -55,6 +76,7 @@ func TestLoginAndDecodeJWT(t *testing.T) {
 // ═══ Step 3: Login → RegisterUser (获取 APIKey) ═══
 
 func TestLoginAndRegisterUser(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	resp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -72,6 +94,7 @@ func TestLoginAndRegisterUser(t *testing.T) {
 // ═══ Step 4: Login → RegisterUser → GetJWTByAPIKey ═══
 
 func TestGetJWTByAPIKey(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	resp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -93,6 +116,7 @@ func TestGetJWTByAPIKey(t *testing.T) {
 // ═══ Step 5: GetPlanStatusJSON (关键：Enterprise 额度) ═══
 
 func TestGetPlanStatusJSON(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	resp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -130,6 +154,7 @@ func TestGetPlanStatusJSON(t *testing.T) {
 // ═══ Step 6: GetUserStatus (gRPC) ═══
 
 func TestGetUserStatus(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	resp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -168,6 +193,7 @@ func TestGetUserStatus(t *testing.T) {
 // ═══ Step 7: Chat gRPC 路径测试 ═══
 
 func TestChatGRPCPath(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	loginResp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -247,6 +273,7 @@ func TestChatGRPCPath(t *testing.T) {
 // ═══ Step 8: 获取原始 PlanStatus JSON 响应 ═══
 
 func TestRawPlanStatusResponse(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 	loginResp, err := svc.LoginWithEmail(testEmail, testPassword)
 	if err != nil {
@@ -283,6 +310,7 @@ func TestRawPlanStatusResponse(t *testing.T) {
 // ═══ Step 9: 完整 enrichment 流程测试 ═══
 
 func TestFullEnrichment(t *testing.T) {
+	requireLiveCredentials(t)
 	svc := NewWindsurfService("")
 
 	// 模拟一个只有 email+password 的账号
@@ -360,6 +388,7 @@ func TestFullEnrichment(t *testing.T) {
 // ═══ 辅助 ═══
 
 func TestDNSResolve(t *testing.T) {
+	requireIntegrationEnv(t)
 	ip := ResolveUpstreamIP()
 	t.Logf("ResolveUpstreamIP: %s", ip)
 	t.Logf("UpstreamHost: %s", UpstreamHost)
@@ -380,6 +409,7 @@ func min(a, b int) int {
 // ═══ 额外：测试 MITM proxy 用的 gRPC 路径（从 IDE 抓包的真实路径）═══
 
 func TestGRPCPathDiscovery(t *testing.T) {
+	requireIntegrationEnv(t)
 	upIP := ResolveUpstreamIP()
 	t.Logf("上游IP: %s", upIP)
 

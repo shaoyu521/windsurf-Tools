@@ -54,6 +54,14 @@ func trafficLog(format string, args ...interface{}) {
 	trafficLogFile.Sync()
 }
 
+func shouldCaptureTrafficPath(path string) bool {
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+	return strings.Contains(path, "getchatmessage") || strings.Contains(path, "getcompletions")
+}
+
 func sanitizePathForFile(s string) string {
 	s = strings.ReplaceAll(s, "/", "_")
 	s = strings.ReplaceAll(s, "\\", "_")

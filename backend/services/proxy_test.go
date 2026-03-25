@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,6 +20,118 @@ func TestSetPoolKeysPreservesCurrentKey(t *testing.T) {
 
 	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
 		t.Fatalf("CurrentAPIKey() after SetPoolKeys = %q, want %q", got, "sk-ws-b")
+	}
+}
+
+func TestPrefetchJWTsOnlyPrefetchesCurrentKey(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	var mu sync.Mutex
+	var calls []string
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		mu.Lock()
+		calls = append(calls, apiKey)
+		mu.Unlock()
+		return "jwt-" + apiKey, nil
+	}
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.SetPoolKeys([]string{"sk-ws-a", "sk-ws-b", "sk-ws-c"})
+	if ok := proxy.SwitchToKey("sk-ws-b"); !ok {
+		t.Fatal("SwitchToKey() = false, want true")
+	}
+
+	proxy.prefetchJWTs()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != "sk-ws-b" {
+		t.Fatalf("prefetchJWTs() calls = %#v, want only current key sk-ws-b", calls)
+	}
+}
+
+func TestRefreshJWTsOnceOnlyRefreshesCurrentKey(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	var mu sync.Mutex
+	var calls []string
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		mu.Lock()
+		calls = append(calls, apiKey)
+		mu.Unlock()
+		return "jwt-refreshed-" + apiKey, nil
+	}
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b", "sk-ws-c"}
+	proxy.currentIdx = 1
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{APIKey: "sk-ws-b", Healthy: true, JWT: []byte("jwt-b")}
+	proxy.keyStates["sk-ws-c"] = &PoolKeyState{APIKey: "sk-ws-c", Healthy: true, JWT: []byte("jwt-c")}
+
+	proxy.refreshJWTsOnce()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != "sk-ws-b" {
+		t.Fatalf("refreshJWTsOnce() calls = %#v, want only current key sk-ws-b", calls)
+	}
+}
+
+func TestEnsureJWTForKeyDeduplicatesConcurrentFetches(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	var mu sync.Mutex
+	calls := 0
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		started <- struct{}{}
+		<-release
+		return "jwt-" + apiKey, nil
+	}
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true}
+
+	var wg sync.WaitGroup
+	results := make(chan string, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- string(proxy.ensureJWTForKey("sk-ws-a"))
+		}()
+	}
+
+	<-started
+	close(release)
+	wg.Wait()
+	close(results)
+
+	mu.Lock()
+	gotCalls := calls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 1", gotCalls)
+	}
+	for result := range results {
+		if result != "jwt-sk-ws-a" {
+			t.Fatalf("ensureJWTForKey() result = %q, want jwt-sk-ws-a", result)
+		}
 	}
 }
 
@@ -212,6 +325,58 @@ func TestHandleResponseStreamQuotaExhaustedRotatesImmediately(t *testing.T) {
 		Body:          io.NopCloser(bytes.NewBufferString("stream-prefix included usage quota is exhausted stream-suffix")),
 		Header:        make(http.Header),
 		Request:       req,
+	}
+
+	proxy.handleResponse(resp)
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
+	}
+	if state := proxy.keyStates["sk-ws-a"]; state == nil || !state.RuntimeExhausted {
+		t.Fatalf("old key state = %#v, want runtime exhausted", state)
+	}
+	if len(injected) == 0 || injected[len(injected)-1] != "sk-ws-b" {
+		t.Fatalf("injectCodeiumConfigFn calls = %#v, want last key sk-ws-b", injected)
+	}
+}
+
+func TestHandleResponseStreamTrailerQuotaExhaustedRotatesImmediately(t *testing.T) {
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		injectCodeiumConfigFn = originalInject
+	})
+
+	var injected []string
+	injectCodeiumConfigFn = func(apiKey string) error {
+		injected = append(injected, apiKey)
+		return nil
+	}
+
+	proxy := NewMitmProxy(nil, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{APIKey: "sk-ws-b", Healthy: true, JWT: []byte("jwt-b")}
+
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService/GetChatMessage", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+
+	resp := &http.Response{
+		StatusCode:    200,
+		ContentLength: -1,
+		Body:          io.NopCloser(bytes.NewBufferString("stream-ok")),
+		Header:        make(http.Header),
+		Trailer: http.Header{
+			"Grpc-Status":  []string{"9"},
+			"Grpc-Message": []string{"Failed%20precondition%3A%20Your%20weekly%20usage%20quota%20has%20been%20exhausted."},
+		},
+		Request: req,
 	}
 
 	proxy.handleResponse(resp)

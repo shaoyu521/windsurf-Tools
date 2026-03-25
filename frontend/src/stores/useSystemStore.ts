@@ -10,34 +10,61 @@ export const useSystemStore = defineStore('system', () => {
   const isGlobalLoading = ref(false)
   /** 当前 windsurf_auth.json 中的邮箱（与号池比对用于「在线」高亮） */
   const currentAuthEmail = ref('')
-  const currentAuthToken = ref('')
+  let authFetchInFlight: Promise<void> | null = null
+  let initInFlight: Promise<void> | null = null
+  let lastInitAt = 0
 
-  const fetchCurrentAuth = async () => {
-    try {
-      const auth = await APIInfo.getCurrentWindsurfAuth()
-      currentAuthEmail.value = auth?.email ?? ''
-      currentAuthToken.value = auth?.token ?? ''
-    } catch {
-      currentAuthEmail.value = ''
-      currentAuthToken.value = ''
+  const fetchCurrentAuth = async (force = false) => {
+    if (!force && authFetchInFlight) {
+      return authFetchInFlight
     }
+    authFetchInFlight = (async () => {
+      try {
+        const auth = await APIInfo.getCurrentWindsurfAuth()
+        currentAuthEmail.value = auth?.email ?? ''
+      } catch {
+        currentAuthEmail.value = ''
+      } finally {
+        authFetchInFlight = null
+      }
+    })()
+    return authFetchInFlight
   }
 
-  const initSystemEnvironment = async () => {
-    try {
-      try {
-        appStoragePath.value = (await APIInfo.getAppStoragePath()) || ''
-      } catch {
-        appStoragePath.value = ''
-      }
-      windsurfPath.value = await APIInfo.findWindsurfPath()
-      if (windsurfPath.value) {
-        patchStatus.value = await APIInfo.checkPatchStatus(windsurfPath.value)
-      }
-      await fetchCurrentAuth()
-    } catch (e) {
-      console.error('Error init system store:', e)
+  const initSystemEnvironment = async (force = false) => {
+    const now = Date.now()
+    if (!force && initInFlight) {
+      return initInFlight
     }
+    if (
+      !force &&
+      now-lastInitAt < 2500 &&
+      (appStoragePath.value || windsurfPath.value || currentAuthEmail.value)
+    ) {
+      return
+    }
+    initInFlight = (async () => {
+      try {
+        const [storagePath, detectedWindsurfPath] = await Promise.all([
+          APIInfo.getAppStoragePath().catch(() => ''),
+          APIInfo.findWindsurfPath().catch(() => ''),
+        ])
+        appStoragePath.value = storagePath || ''
+        windsurfPath.value = detectedWindsurfPath || ''
+        if (windsurfPath.value) {
+          patchStatus.value = await APIInfo.checkPatchStatus(windsurfPath.value)
+        } else {
+          patchStatus.value = false
+        }
+        await fetchCurrentAuth(force)
+        lastInitAt = Date.now()
+      } catch (e) {
+        console.error('Error init system store:', e)
+      } finally {
+        initInFlight = null
+      }
+    })()
+    return initInFlight
   }
 
   const detectWindsurfPath = async () => {
@@ -89,7 +116,6 @@ export const useSystemStore = defineStore('system', () => {
     patchStatus,
     isGlobalLoading,
     currentAuthEmail,
-    currentAuthToken,
     fetchCurrentAuth,
     initSystemEnvironment,
     detectWindsurfPath,

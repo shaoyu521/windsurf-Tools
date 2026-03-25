@@ -231,6 +231,9 @@ func quotaDataIsStale(acc *models.Account) bool {
 	if !utils.AccountQuotaExhausted(acc) {
 		return false // 未耗尽的不算过期
 	}
+	if utils.QuotaRefreshDueAfterOfficialReset(*acc, time.Now()) {
+		return true
+	}
 	raw := strings.TrimSpace(acc.LastQuotaUpdate)
 	if raw == "" {
 		return true // 从未同步过

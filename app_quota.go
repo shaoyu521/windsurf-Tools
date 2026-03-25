@@ -150,8 +150,8 @@ func (a *App) restartQuotaHotPollIfNeeded() {
 func (a *App) quotaHotPollLoop(ctx context.Context) {
 	for {
 		a.pollCurrentSessionQuotaAndMaybeSwitch()
-		sec := clampQuotaHotPollSeconds(a.store.GetSettings().QuotaHotPollSeconds)
-		t := time.NewTimer(time.Duration(sec) * time.Second)
+		delay := a.nextQuotaHotPollDelay()
+		t := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			t.Stop()
@@ -161,20 +161,32 @@ func (a *App) quotaHotPollLoop(ctx context.Context) {
 	}
 }
 
+func (a *App) nextQuotaHotPollDelay() time.Duration {
+	settings := a.store.GetSettings()
+	base := time.Duration(clampQuotaHotPollSeconds(settings.QuotaHotPollSeconds)) * time.Second
+	auth, _ := a.switchSvc.GetCurrentAuth()
+	curID := a.findCurrentMonitoredAccountID(auth, settings.MitmOnly)
+	if curID == "" {
+		return base
+	}
+	cur, err := a.store.GetAccount(curID)
+	if err != nil {
+		return base
+	}
+	delay := utils.NextQuotaResetWakeDelayForExhausted(cur, time.Now(), base)
+	if delay < base {
+		utils.DLog("[热轮询/reset] wake-schedule account=%s base=%s next=%s reason=reset-window daily={%s} weekly={%s}",
+			labelAccountResult(cur), base, delay, describeQuotaResetField(cur.DailyRemaining, cur.DailyResetAt, cur.LastQuotaUpdate, time.Now()), describeQuotaResetField(cur.WeeklyRemaining, cur.WeeklyResetAt, cur.LastQuotaUpdate, time.Now()))
+	}
+	return delay
+}
+
 func (a *App) pollCurrentSessionQuotaAndMaybeSwitch() {
 	settings := a.store.GetSettings()
 	if !settings.AutoRefreshQuotas || !settings.AutoSwitchOnQuotaExhausted {
 		utils.DLog("[热轮询] 跳过: AutoRefreshQuotas=%v AutoSwitch=%v", settings.AutoRefreshQuotas, settings.AutoSwitchOnQuotaExhausted)
 		return
 	}
-
-	a.lastQuotaHotSwitchMu.Lock()
-	if t := a.lastQuotaHotSwitch; !t.IsZero() && time.Since(t) < 12*time.Second {
-		a.lastQuotaHotSwitchMu.Unlock()
-		utils.DLog("[热轮询] 跳过: 距上次切号仅 %.1fs (<12s 冷却)", time.Since(t).Seconds())
-		return
-	}
-	a.lastQuotaHotSwitchMu.Unlock()
 
 	var auth *services.WindsurfAuthJSON
 	if got, err := a.switchSvc.GetCurrentAuth(); err == nil {
@@ -197,6 +209,20 @@ func (a *App) pollCurrentSessionQuotaAndMaybeSwitch() {
 		utils.DLog("[热轮询] 跳过: GetAccount(%s) 失败: %v", curID, err)
 		return
 	}
+	now := time.Now()
+	forceRefreshAfterReset := utils.QuotaRefreshDueAfterOfficialReset(cur, now)
+	a.logHotPollResetSnapshot("precheck", cur, forceRefreshAfterReset, now)
+	a.lastQuotaHotSwitchMu.Lock()
+	if t := a.lastQuotaHotSwitch; !t.IsZero() && time.Since(t) < 12*time.Second && !forceRefreshAfterReset {
+		a.lastQuotaHotSwitchMu.Unlock()
+		utils.DLog("[热轮询] 跳过: 距上次切号仅 %.1fs (<12s 冷却)", time.Since(t).Seconds())
+		return
+	}
+	a.lastQuotaHotSwitchMu.Unlock()
+	if forceRefreshAfterReset {
+		utils.DLog("[热轮询/reset] due-now account=%s action=force-refresh reason=official-reset-reached daily={%s} weekly={%s}",
+			labelAccountResult(cur), describeQuotaResetField(cur.DailyRemaining, cur.DailyResetAt, cur.LastQuotaUpdate, now), describeQuotaResetField(cur.WeeklyRemaining, cur.WeeklyResetAt, cur.LastQuotaUpdate, now))
+	}
 	if cur.WindsurfAPIKey == "" && strings.TrimSpace(cur.Token) == "" && authToken == "" &&
 		cur.RefreshToken == "" && (cur.Email == "" || cur.Password == "") {
 		utils.DLog("[热轮询] 跳过: %s 无任何可用凭证", cur.Email)
@@ -216,6 +242,7 @@ func (a *App) pollCurrentSessionQuotaAndMaybeSwitch() {
 	if quotaOK {
 		copyAcc.LastQuotaUpdate = time.Now().Format(time.RFC3339)
 	}
+	a.logHotPollResetSnapshot("post-refresh", copyAcc, false, time.Now())
 	if err := a.store.UpdateAccount(copyAcc); err != nil {
 		utils.DLog("[热轮询] UpdateAccount 失败: %v", err)
 		return
@@ -223,9 +250,13 @@ func (a *App) pollCurrentSessionQuotaAndMaybeSwitch() {
 	a.syncMitmPoolKeys()
 	if !utils.AccountQuotaExhausted(&copyAcc) {
 		utils.DLog("[热轮询] %s 额度正常 (daily=%s weekly=%s)", copyAcc.Email, copyAcc.DailyRemaining, copyAcc.WeeklyRemaining)
+		utils.DLog("[热轮询/reset] decision account=%s result=keep-current daily={%s} weekly={%s}",
+			labelAccountResult(copyAcc), describeQuotaResetField(copyAcc.DailyRemaining, copyAcc.DailyResetAt, copyAcc.LastQuotaUpdate, time.Now()), describeQuotaResetField(copyAcc.WeeklyRemaining, copyAcc.WeeklyResetAt, copyAcc.LastQuotaUpdate, time.Now()))
 		return
 	}
 	utils.DLog("[热轮询] ★ %s 额度用尽! (daily=%s weekly=%s plan=%s) → 触发切号", copyAcc.Email, copyAcc.DailyRemaining, copyAcc.WeeklyRemaining, copyAcc.PlanName)
+	utils.DLog("[热轮询/reset] decision account=%s result=exhausted-switch daily={%s} weekly={%s}",
+		labelAccountResult(copyAcc), describeQuotaResetField(copyAcc.DailyRemaining, copyAcc.DailyResetAt, copyAcc.LastQuotaUpdate, time.Now()), describeQuotaResetField(copyAcc.WeeklyRemaining, copyAcc.WeeklyResetAt, copyAcc.LastQuotaUpdate, time.Now()))
 	if settings.MitmOnly {
 		if next, err := a.rotateMitmToNextAvailable(curID, settings.AutoSwitchPlanFilter); err == nil {
 			utils.DLog("[热轮询] MITM轮换成功 → %s", next.Email)
@@ -246,6 +277,44 @@ func (a *App) pollCurrentSessionQuotaAndMaybeSwitch() {
 	a.lastQuotaHotSwitchMu.Lock()
 	a.lastQuotaHotSwitch = time.Now()
 	a.lastQuotaHotSwitchMu.Unlock()
+}
+
+func describeQuotaResetField(remaining, resetAt, lastQuotaUpdate string, now time.Time) string {
+	parts := make([]string, 0, 4)
+	if strings.TrimSpace(remaining) == "" {
+		parts = append(parts, "remaining=<empty>")
+	} else {
+		parts = append(parts, "remaining="+strings.TrimSpace(remaining))
+	}
+	resetAt = strings.TrimSpace(resetAt)
+	if resetAt == "" {
+		parts = append(parts, "reset=<none>")
+	} else if resetTime, err := time.Parse(time.RFC3339, resetAt); err == nil {
+		parts = append(parts, "reset="+resetAt)
+		delta := resetTime.Sub(now)
+		switch {
+		case delta > 0:
+			parts = append(parts, fmt.Sprintf("reset_in=%s", delta.Round(time.Second)))
+		case delta < 0:
+			parts = append(parts, fmt.Sprintf("reset_ago=%s", (-delta).Round(time.Second)))
+		default:
+			parts = append(parts, "reset_now=true")
+		}
+	} else {
+		parts = append(parts, "reset="+resetAt)
+		parts = append(parts, "reset_parse=invalid")
+	}
+	if strings.TrimSpace(lastQuotaUpdate) == "" {
+		parts = append(parts, "last=<none>")
+	} else {
+		parts = append(parts, "last="+strings.TrimSpace(lastQuotaUpdate))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (a *App) logHotPollResetSnapshot(stage string, acc models.Account, force bool, now time.Time) {
+	utils.DLog("[热轮询/reset] %s account=%s plan=%s force=%v daily={%s} weekly={%s}",
+		stage, labelAccountResult(acc), acc.PlanName, force, describeQuotaResetField(acc.DailyRemaining, acc.DailyResetAt, acc.LastQuotaUpdate, now), describeQuotaResetField(acc.WeeklyRemaining, acc.WeeklyResetAt, acc.LastQuotaUpdate, now))
 }
 
 func (a *App) refreshDueQuotas() {
@@ -275,7 +344,8 @@ func (a *App) refreshDueQuotas() {
 	}
 	dueAccounts := make([]models.Account, 0, len(accounts))
 	for _, acc := range accounts {
-		if !utils.QuotaRefreshDue(acc.LastQuotaUpdate, policy, customMins, now) {
+		if !utils.QuotaRefreshDue(acc.LastQuotaUpdate, policy, customMins, now) &&
+			!utils.QuotaRefreshDueAfterOfficialReset(acc, now) {
 			continue
 		}
 		if acc.WindsurfAPIKey == "" && acc.Token == "" && acc.RefreshToken == "" && (acc.Email == "" || acc.Password == "") {
@@ -433,6 +503,7 @@ func (a *App) syncAccountCredentialsWithService(svc *services.WindsurfService, a
 		}
 		utils.DLog("[凭证] %s JWT获取失败(APIKey): %v", label, lastErr)
 		log.Printf("[切号] %s JWT获取失败(APIKey): %v", label, lastErr)
+		applyAccessErrorStatus(acc, lastErr)
 		return
 	}
 	if acc.RefreshToken != "" {
@@ -485,7 +556,14 @@ func (a *App) refreshAllTokens() map[string]string {
 		if acc.WindsurfAPIKey != "" {
 			jwt, err := svc.GetJWTByAPIKey(acc.WindsurfAPIKey)
 			if err != nil {
-				return accountRefreshOutcome{label: label, status: "JWT刷新失败: " + err.Error()}
+				before := acc
+				applyAccessErrorStatus(&acc, err)
+				return accountRefreshOutcome{
+					label:   label,
+					status:  "JWT刷新失败: " + err.Error(),
+					account: acc,
+					updated: acc != before,
+				}
 			}
 			acc.Token = jwt
 			if a.enrichAccountInfoWithService(svc, &acc) {
