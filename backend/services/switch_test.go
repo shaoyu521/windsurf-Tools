@@ -25,7 +25,7 @@ func configureSwitchTestEnv(t *testing.T) string {
 		return filepath.Join(homeDir, ".codeium", "windsurf", "config", "windsurf_auth.json")
 	default:
 		t.Setenv("USERPROFILE", homeDir)
-		return filepath.Join(homeDir, ".codeium", "windsurf", "config", "windsurf_auth.json")
+		return filepath.Join(homeDir, ".config", "Windsurf", "User", "globalStorage", "windsurf_auth.json")
 	}
 }
 

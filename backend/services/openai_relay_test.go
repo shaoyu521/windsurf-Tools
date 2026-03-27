@@ -3,12 +3,14 @@ package services
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestRelay() *OpenAIRelay {
@@ -404,6 +406,271 @@ func TestFinalizeRelayOutcome_QuotaDoesNotRecordSuccess(t *testing.T) {
 	}
 	if !state.RuntimeExhausted {
 		t.Fatal("RuntimeExhausted should be true after quota failure")
+	}
+}
+
+func TestFinalizeRelayOutcome_RateLimitRotatesToNextKey(t *testing.T) {
+	relay := newTestRelay()
+	relay.proxy.keyStates["sk-ws-test1"].JWT = []byte("jwt-a")
+	relay.proxy.keyStates["sk-ws-test2"].JWT = []byte("jwt-b")
+
+	relay.finalizeRelayOutcome("sk-ws-test1", upstreamFailureRateLimit, "Permission denied: Rate limit exceeded")
+
+	if got := relay.proxy.CurrentAPIKey(); got != "sk-ws-test2" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-test2")
+	}
+	state := relay.proxy.keyStates["sk-ws-test1"]
+	if state == nil || state.Healthy || !state.CooldownUntil.After(time.Now()) || state.RuntimeExhausted {
+		t.Fatalf("old key state = %#v, want rate-limited cooldown without runtime exhaustion", state)
+	}
+}
+
+func TestFinalizeRelayOutcome_AuthRotatesToNextKeyBeforeRefreshingJWT(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "jwt-refresh-" + apiKey, nil
+	}
+
+	relay := newTestRelay()
+	relay.proxy.keyStates["sk-ws-test1"].JWT = []byte("jwt-a")
+	relay.proxy.keyStates["sk-ws-test2"].JWT = []byte("jwt-b")
+
+	relay.finalizeRelayOutcome("sk-ws-test1", upstreamFailureAuth, "Unauthenticated: an internal error occurred")
+
+	if refreshCalls != 0 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 0", refreshCalls)
+	}
+	if got := relay.proxy.CurrentAPIKey(); got != "sk-ws-test2" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-test2")
+	}
+}
+
+func TestHandleChatCompletionsAuthFailureRotatesToNextKeyAndRetries(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "jwt-refresh-" + apiKey, nil
+	}
+
+	relay := newTestRelay()
+	relay.proxy.keyStates["sk-ws-test1"].JWT = []byte("jwt-a")
+	relay.proxy.keyStates["sk-ws-test2"].JWT = []byte("jwt-b")
+
+	calls := 0
+	relay.upstream = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			if got := req.Header.Get("Authorization"); got != "Bearer jwt-a" {
+				t.Fatalf("first request auth = %q, want %q", got, "Bearer jwt-a")
+			}
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: int64(len("Unauthenticated: an internal error occurred")),
+				Body:          io.NopCloser(strings.NewReader("Unauthenticated: an internal error occurred")),
+				Header:        http.Header{"Grpc-Status": []string{"16"}},
+				Request:       req,
+			}, nil
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer jwt-b" {
+			t.Fatalf("retry request auth = %q, want %q", got, "Bearer jwt-b")
+		}
+		payload := appendGRPCFrame(nil, encodeBytesField(1, []byte("hello")))
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len(payload)),
+			Body:          io.NopCloser(strings.NewReader(string(payload))),
+			Header:        make(http.Header),
+			Trailer:       make(http.Header),
+			Request:       req,
+		}, nil
+	})
+
+	body := `{"model":"cascade","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	relay.handleChatCompletions(w, req)
+
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 0", refreshCalls)
+	}
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"content":"hello"`) {
+		t.Fatalf("response body missing assistant content: %s", w.Body.String())
+	}
+	if got := relay.proxy.CurrentAPIKey(); got != "sk-ws-test2" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-test2")
+	}
+}
+
+func TestHandleChatCompletionsAuthFailureWithoutSpareReturnsAuthError(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "", errors.New("refresh failed")
+	}
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.SetPoolKeys([]string{"sk-ws-test1"})
+	proxy.keyStates["sk-ws-test1"].JWT = []byte("jwt-a")
+	relay := NewOpenAIRelay(proxy, func(string) {}, "")
+
+	calls := 0
+	relay.upstream = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len("Unauthenticated: an internal error occurred")),
+			Body:          io.NopCloser(strings.NewReader("Unauthenticated: an internal error occurred")),
+			Header:        http.Header{"Grpc-Status": []string{"16"}},
+			Request:       req,
+		}, nil
+	})
+
+	body := `{"model":"cascade","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	relay.handleChatCompletions(w, req)
+
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 1", refreshCalls)
+	}
+	if w.Code != 401 {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"type":"authentication_error"`) {
+		t.Fatalf("response body missing authentication_error: %s", w.Body.String())
+	}
+}
+
+func TestHandleChatCompletionsRateLimitRotatesToNextKeyAndRetries(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "jwt-refresh-" + apiKey, nil
+	}
+
+	relay := newTestRelay()
+	relay.proxy.keyStates["sk-ws-test1"].JWT = []byte("jwt-a")
+	relay.proxy.keyStates["sk-ws-test2"].JWT = []byte("jwt-b")
+
+	calls := 0
+	relay.upstream = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			body := "Permission denied: Rate limit exceeded. Your request was not processed, and no credits were used. Please upgrade to a Pro account for higher limits or try again in about an hour. Rate limit error"
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: int64(len(body)),
+				Body:          io.NopCloser(strings.NewReader(body)),
+				Header:        http.Header{"Grpc-Status": []string{"7"}},
+				Request:       req,
+			}, nil
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer jwt-b" {
+			t.Fatalf("retry request auth = %q, want %q", got, "Bearer jwt-b")
+		}
+		payload := appendGRPCFrame(nil, encodeBytesField(1, []byte("hello")))
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len(payload)),
+			Body:          io.NopCloser(strings.NewReader(string(payload))),
+			Header:        make(http.Header),
+			Trailer:       make(http.Header),
+			Request:       req,
+		}, nil
+	})
+
+	body := `{"model":"cascade","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	relay.handleChatCompletions(w, req)
+
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 0", refreshCalls)
+	}
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"content":"hello"`) {
+		t.Fatalf("response body missing assistant content: %s", w.Body.String())
+	}
+	if got := relay.proxy.CurrentAPIKey(); got != "sk-ws-test2" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-test2")
+	}
+}
+
+func TestHandleChatCompletionsRateLimitWithoutSpareReturnsRateLimitError(t *testing.T) {
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.SetPoolKeys([]string{"sk-ws-test1"})
+	proxy.keyStates["sk-ws-test1"].JWT = []byte("jwt-a")
+	relay := NewOpenAIRelay(proxy, func(string) {}, "")
+
+	calls := 0
+	relay.upstream = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body := "Permission denied: Rate limit exceeded. Your request was not processed, and no credits were used. Please upgrade to a Pro account for higher limits or try again in about an hour. Rate limit error"
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len(body)),
+			Body:          io.NopCloser(strings.NewReader(body)),
+			Header:        http.Header{"Grpc-Status": []string{"7"}},
+			Request:       req,
+		}, nil
+	})
+
+	body := `{"model":"cascade","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	relay.handleChatCompletions(w, req)
+
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls)
+	}
+	if w.Code != 429 {
+		t.Fatalf("status = %d, want 429", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"type":"rate_limit"`) {
+		t.Fatalf("response body missing rate_limit: %s", w.Body.String())
 	}
 }
 

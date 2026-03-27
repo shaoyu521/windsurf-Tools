@@ -262,15 +262,27 @@ func (r *OpenAIRelay) handleChatCompletions(w http.ResponseWriter, req *http.Req
 				r.proxy.markRuntimeExhaustedAndRotate(apiKey, "relay-quota")
 				continue
 			}
+			if kind == upstreamFailureRateLimit {
+				r.log("限速命中 key=%s... 自动轮转重试(%d/%d)", truncKey(apiKey), attempt+1, r.maxRetry)
+				if rotatedKey := r.proxy.markRateLimitedAndRotate(apiKey, "relay-rate-limit="+err.Error()); rotatedKey != "" {
+					continue
+				}
+				writeRelayUpstreamFailure(w, kind, err.Error())
+				return
+			}
 			if kind == upstreamFailureAuth {
-				r.log("认证失败 key=%s... 尝试刷新JWT(%d/%d)", truncKey(apiKey), attempt+1, r.maxRetry)
+				r.log("认证失败 key=%s... 优先切换到下一把 key(%d/%d)", truncKey(apiKey), attempt+1, r.maxRetry)
+				if rotatedKey := r.proxy.rotateAfterAuthFailure(apiKey, "relay-auth="+err.Error()); rotatedKey != "" {
+					continue
+				}
+				r.log("无可用备用 key，回退刷新当前 JWT: %s...", truncKey(apiKey))
 				refreshed := r.proxy.refreshJWTForKey(apiKey)
 				if len(refreshed) > 0 {
 					continue // 用刷新后的 JWT 重试（pickPoolKeyAndJWT 会拿到新 JWT）
 				}
-				r.log("JWT 刷新失败，尝试切到下一把 key")
-				r.proxy.markRuntimeExhaustedAndRotate(apiKey, "relay-auth")
-				continue
+				r.log("JWT 刷新失败，保留当前认证错误")
+				writeRelayUpstreamFailure(w, kind, err.Error())
+				return
 			}
 			r.log("gRPC error (kind=%s): %v", string(kind), err)
 			writeOpenAIError(w, 502, "upstream_error", err.Error())
@@ -545,6 +557,9 @@ func writeRelayUpstreamFailure(w http.ResponseWriter, kind upstreamFailureKind, 
 	case upstreamFailureQuota:
 		status = 429
 		errType = "quota_exhausted"
+	case upstreamFailureRateLimit:
+		status = 429
+		errType = "rate_limit"
 	case upstreamFailureAuth:
 		status = 401
 		errType = "authentication_error"
@@ -578,10 +593,15 @@ func (r *OpenAIRelay) finalizeRelayOutcome(apiKey string, kind upstreamFailureKi
 	case upstreamFailureQuota:
 		r.log("relay 结束为额度失败: key=%s... detail=%s", truncKey(apiKey), truncate(detail, 180))
 		r.proxy.markRuntimeExhaustedAndRotate(apiKey, "relay-finished="+detail)
+	case upstreamFailureRateLimit:
+		r.log("relay 结束为限速失败: key=%s... detail=%s", truncKey(apiKey), truncate(detail, 180))
+		r.proxy.markRateLimitedAndRotate(apiKey, "relay-rate-limit="+detail)
 	case upstreamFailureAuth:
 		r.log("relay 结束为认证失败: key=%s... detail=%s", truncKey(apiKey), truncate(detail, 180))
-		if len(r.proxy.refreshJWTForKey(apiKey)) == 0 {
-			r.proxy.markRuntimeExhaustedAndRotate(apiKey, "relay-auth="+detail)
+		if rotatedKey := r.proxy.rotateAfterAuthFailure(apiKey, "relay-auth="+detail); rotatedKey == "" {
+			if len(r.proxy.refreshJWTForKey(apiKey)) == 0 {
+				r.log("relay 认证失败且 JWT 刷新失败，无备用 key: %s...", truncKey(apiKey))
+			}
 		}
 	default:
 		r.log("relay 结束为上游失败: key=%s... kind=%s detail=%s", truncKey(apiKey), kind, truncate(detail, 180))

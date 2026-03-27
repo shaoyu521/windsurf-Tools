@@ -30,9 +30,9 @@
 
 | 最新主界面预览 |
 | :---: |
-| ![Windsurf Tools 最新界面预览](docs/images/dashboard-preview.png) |
+| ![Windsurf Tools 最新界面预览（已脱敏）](docs/images/dashboard-preview.png) |
 
-> 当前仓库预览图已同步为最新桌面端截图，展示控制台首页、MITM 面板与健康度概览。源文件位于 `docs/images/dashboard-preview.png` 与 `build/browser-preview.png`。
+> 当前仓库预览图为最新桌面端界面的脱敏示意图，已去除真实账号、邮箱与会话标识。源文件位于 `docs/images/dashboard-preview.png` 与 `build/browser-preview.png`。
 
 ---
 

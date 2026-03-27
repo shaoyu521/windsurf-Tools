@@ -207,7 +207,7 @@ const handleSetupHosts = async () => {
     await fetchStatus(true);
     showToast("Hosts 已配置", "success");
   } catch (e: any) {
-    error.value = `Hosts 配置失败(需要管理员权限): ${String(e)}`;
+    error.value = `Hosts 配置失败（Linux 会尝试 pkexec/sudo 提权）: ${String(e)}`;
   } finally {
     loading.value = false;
   }
@@ -392,7 +392,12 @@ const handleTeardown = async () => {
             <IToggle
               :modelValue="!!status?.running"
               @update:modelValue="handleToggle"
-              :disabled="loading || mitmStore.switchLoading"
+              :disabled="
+                loading ||
+                mitmStore.switchLoading ||
+                (!status?.running &&
+                  (!status?.ca_installed || !status?.hosts_mapped))
+              "
             />
           </div>
         </div>

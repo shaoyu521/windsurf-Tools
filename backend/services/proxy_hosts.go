@@ -60,8 +60,8 @@ func AddHostsEntry(domain string) error {
 	addition := "\n" + strings.Join(lines, "\n") + "\n"
 	newContent := content + addition
 
-	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
-		return fmt.Errorf("写入 hosts 文件失败(需要管理员权限): %w", err)
+	if err := writeSystemFile(path, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("写入 hosts 文件失败（Linux 会尝试 pkexec/sudo 提权）: %w", err)
 	}
 
 	return flushDNS()
@@ -75,7 +75,7 @@ func RemoveHostsEntry(domain string) error {
 	// 优先从备份恢复
 	backup := hostsBackupPath()
 	if backupData, err := os.ReadFile(backup); err == nil && len(backupData) > 0 {
-		if err := os.WriteFile(path, backupData, 0644); err == nil {
+		if err := writeSystemFile(path, backupData, 0644); err == nil {
 			_ = os.Remove(backup)
 			return flushDNS()
 		}
@@ -102,8 +102,8 @@ func RemoveHostsEntry(domain string) error {
 		newContent += "\n"
 	}
 
-	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
-		return fmt.Errorf("写入 hosts 文件失败(需要管理员权限): %w", err)
+	if err := writeSystemFile(path, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("写入 hosts 文件失败（Linux 会尝试 pkexec/sudo 提权）: %w", err)
 	}
 
 	return flushDNS()

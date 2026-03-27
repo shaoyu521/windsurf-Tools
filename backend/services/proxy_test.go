@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -87,7 +88,7 @@ func TestPrefetchJWTsOnlyPrefetchesCurrentKey(t *testing.T) {
 		return "jwt-" + apiKey, nil
 	}
 
-	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy := NewMitmProxy(&WindsurfService{client: &http.Client{}}, nil, "")
 	proxy.SetPoolKeys([]string{"sk-ws-a", "sk-ws-b", "sk-ws-c"})
 	if ok := proxy.SwitchToKey("sk-ws-b"); !ok {
 		t.Fatal("SwitchToKey() = false, want true")
@@ -117,7 +118,7 @@ func TestRefreshJWTsOnceOnlyRefreshesCurrentKey(t *testing.T) {
 		return "jwt-refreshed-" + apiKey, nil
 	}
 
-	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy := NewMitmProxy(&WindsurfService{client: &http.Client{}}, nil, "")
 	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b", "sk-ws-c"}
 	proxy.currentIdx = 1
 	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
@@ -130,6 +131,85 @@ func TestRefreshJWTsOnceOnlyRefreshesCurrentKey(t *testing.T) {
 	defer mu.Unlock()
 	if len(calls) != 1 || calls[0] != "sk-ws-b" {
 		t.Fatalf("refreshJWTsOnce() calls = %#v, want only current key sk-ws-b", calls)
+	}
+}
+
+func TestPickPoolKeyAndJWTRefreshesStaleCurrentJWTBeforeUse(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+	})
+
+	calls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		calls++
+		return "jwt-refreshed-" + apiKey, nil
+	}
+
+	proxy := NewMitmProxy(&WindsurfService{client: &http.Client{}}, nil, "")
+	proxy.SetPoolKeys([]string{"sk-ws-a"})
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{
+		APIKey:       "sk-ws-a",
+		Healthy:      true,
+		JWT:          []byte("jwt-stale"),
+		JWTUpdatedAt: time.Now().Add(-(jwtRefreshMinutes*time.Minute + time.Minute)),
+	}
+
+	key, jwt := proxy.pickPoolKeyAndJWT()
+
+	if key != "sk-ws-a" {
+		t.Fatalf("pickPoolKeyAndJWT() key = %q, want %q", key, "sk-ws-a")
+	}
+	if got := string(jwt); got != "jwt-refreshed-sk-ws-a" {
+		t.Fatalf("pickPoolKeyAndJWT() jwt = %q, want refreshed JWT", got)
+	}
+	if calls != 1 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 1", calls)
+	}
+}
+
+func TestRotateAfterAuthFailureRefreshesRotatedOutKeyInBackground(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+		injectCodeiumConfigFn = originalInject
+	})
+
+	refreshedCh := make(chan string, 1)
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshedCh <- apiKey
+		return "jwt-new-" + apiKey, nil
+	}
+	injectCodeiumConfigFn = func(apiKey string) error { return nil }
+
+	proxy := NewMitmProxy(&WindsurfService{client: &http.Client{}}, nil, "")
+	proxy.SetPoolKeys([]string{"sk-ws-a", "sk-ws-b"})
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{
+		APIKey:       "sk-ws-a",
+		Healthy:      true,
+		JWT:          []byte("jwt-old-a"),
+		JWTUpdatedAt: time.Now(),
+	}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{
+		APIKey:       "sk-ws-b",
+		Healthy:      true,
+		JWT:          []byte("jwt-b"),
+		JWTUpdatedAt: time.Now(),
+	}
+
+	rotated := proxy.rotateAfterAuthFailure("sk-ws-a", "Unauthenticated: an internal error occurred")
+	if rotated != "sk-ws-b" {
+		t.Fatalf("rotateAfterAuthFailure() = %q, want %q", rotated, "sk-ws-b")
+	}
+
+	select {
+	case apiKey := <-refreshedCh:
+		if apiKey != "sk-ws-a" {
+			t.Fatalf("background refresh apiKey = %q, want %q", apiKey, "sk-ws-a")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("background JWT refresh was not triggered for rotated-out key")
 	}
 }
 
@@ -232,6 +312,17 @@ func TestClassifyUpstreamFailureTreatsPermissionDeniedApiWireErrorAsAuth(t *test
 	}
 	if detail == "" {
 		t.Fatal("classifyUpstreamFailure() detail empty, want auth detail")
+	}
+}
+
+func TestClassifyUpstreamFailureTreatsPermissionDeniedRateLimitAsRateLimit(t *testing.T) {
+	body := "Permission denied: Rate limit exceeded. Your request was not processed, and no credits were used. Please upgrade to a Pro account for higher limits or try again in about an hour. https://windsurf.com/redirect/windsurf/add-credits: Rate limit error"
+	kind, detail := classifyUpstreamFailure("7", "", body)
+	if kind != upstreamFailureRateLimit {
+		t.Fatalf("classifyUpstreamFailure() kind = %q, want %q", kind, upstreamFailureRateLimit)
+	}
+	if detail == "" {
+		t.Fatal("classifyUpstreamFailure() detail empty, want rate-limit detail")
 	}
 }
 
@@ -444,6 +535,160 @@ func TestHandleResponseStreamTrailerQuotaExhaustedRotatesImmediately(t *testing.
 	}
 }
 
+func TestHandleResponseBufferedAuthRotatesForNextRequest(t *testing.T) {
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		injectCodeiumConfigFn = originalInject
+	})
+
+	var injected []string
+	injectCodeiumConfigFn = func(apiKey string) error {
+		injected = append(injected, apiKey)
+		return nil
+	}
+
+	proxy := NewMitmProxy(nil, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{APIKey: "sk-ws-b", Healthy: true, JWT: []byte("jwt-b")}
+
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService/GetChatMessage", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+
+	resp := &http.Response{
+		StatusCode:    200,
+		ContentLength: int64(len("Unauthenticated: an internal error occurred")),
+		Body:          io.NopCloser(bytes.NewBufferString("Unauthenticated: an internal error occurred")),
+		Header:        http.Header{"Grpc-Status": []string{"16"}},
+		Request:       req,
+	}
+
+	proxy.handleResponse(resp)
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
+	}
+	if state := proxy.keyStates["sk-ws-a"]; state == nil || state.RuntimeExhausted {
+		t.Fatalf("old key state = %#v, want auth rotation without runtime exhaustion", state)
+	}
+	if len(injected) == 0 || injected[len(injected)-1] != "sk-ws-b" {
+		t.Fatalf("injectCodeiumConfigFn calls = %#v, want last key sk-ws-b", injected)
+	}
+}
+
+func TestHandleResponseStreamTrailerAuthRotatesImmediately(t *testing.T) {
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		injectCodeiumConfigFn = originalInject
+	})
+
+	var injected []string
+	injectCodeiumConfigFn = func(apiKey string) error {
+		injected = append(injected, apiKey)
+		return nil
+	}
+
+	proxy := NewMitmProxy(nil, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{APIKey: "sk-ws-b", Healthy: true, JWT: []byte("jwt-b")}
+
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService/GetChatMessage", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+
+	resp := &http.Response{
+		StatusCode:    200,
+		ContentLength: -1,
+		Body:          io.NopCloser(bytes.NewBufferString("stream-ok")),
+		Header:        make(http.Header),
+		Trailer: http.Header{
+			"Grpc-Status":  []string{"16"},
+			"Grpc-Message": []string{"Unauthenticated%3A%20an%20internal%20error%20occurred"},
+		},
+		Request: req,
+	}
+
+	proxy.handleResponse(resp)
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
+	}
+	if state := proxy.keyStates["sk-ws-a"]; state == nil || state.RuntimeExhausted {
+		t.Fatalf("old key state = %#v, want auth rotation without runtime exhaustion", state)
+	}
+	if len(injected) == 0 || injected[len(injected)-1] != "sk-ws-b" {
+		t.Fatalf("injectCodeiumConfigFn calls = %#v, want last key sk-ws-b", injected)
+	}
+}
+
+func TestHandleResponseStreamTrailerRateLimitRotatesImmediately(t *testing.T) {
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		injectCodeiumConfigFn = originalInject
+	})
+
+	var injected []string
+	injectCodeiumConfigFn = func(apiKey string) error {
+		injected = append(injected, apiKey)
+		return nil
+	}
+
+	proxy := NewMitmProxy(nil, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{APIKey: "sk-ws-b", Healthy: true, JWT: []byte("jwt-b")}
+
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService/GetChatMessage", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+
+	resp := &http.Response{
+		StatusCode:    200,
+		ContentLength: -1,
+		Body:          io.NopCloser(bytes.NewBufferString("stream-ok")),
+		Header:        make(http.Header),
+		Trailer: http.Header{
+			"Grpc-Status": []string{"7"},
+			"Grpc-Message": []string{
+				url.QueryEscape("Permission denied: Rate limit exceeded. Your request was not processed, and no credits were used. Please upgrade to a Pro account for higher limits or try again in about an hour. Rate limit error"),
+			},
+		},
+		Request: req,
+	}
+
+	proxy.handleResponse(resp)
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
+	}
+	if state := proxy.keyStates["sk-ws-a"]; state == nil || state.Healthy || !state.CooldownUntil.After(time.Now()) || state.RuntimeExhausted {
+		t.Fatalf("old key state = %#v, want rate-limited cooldown without runtime exhaustion", state)
+	}
+	if len(injected) == 0 || injected[len(injected)-1] != "sk-ws-b" {
+		t.Fatalf("injectCodeiumConfigFn calls = %#v, want last key sk-ws-b", injected)
+	}
+}
+
 func TestStatusIncludesRuntimeExhaustedFlag(t *testing.T) {
 	proxy := NewMitmProxy(nil, nil, "")
 	proxy.poolKeys = []string{"sk-ws-a"}
@@ -496,7 +741,7 @@ func TestPrefetchSpecificJWTsForceRefreshesExistingJWT(t *testing.T) {
 	}
 }
 
-func TestRetryTransportAuthFailureRefreshesJWTAndRetries(t *testing.T) {
+func TestRetryTransportAuthFailureRefreshesJWTWhenNoSpareKey(t *testing.T) {
 	originalGetJWT := getJWTByAPIKeyFn
 	t.Cleanup(func() {
 		getJWTByAPIKeyFn = originalGetJWT
@@ -561,6 +806,87 @@ func TestRetryTransportAuthFailureRefreshesJWTAndRetries(t *testing.T) {
 	}
 	if got := string(proxy.jwtBytesForKey("sk-ws-a")); got != "jwt-new-sk-ws-a" {
 		t.Fatalf("jwtBytesForKey() = %q, want refreshed JWT", got)
+	}
+}
+
+func TestRetryTransportAuthFailureRotatesToNextKeyBeforeRefreshingJWT(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+		injectCodeiumConfigFn = originalInject
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "jwt-new-" + apiKey, nil
+	}
+	injectCodeiumConfigFn = func(apiKey string) error { return nil }
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{
+		APIKey:  "sk-ws-a",
+		Healthy: true,
+		JWT:     []byte("jwt-old-a"),
+	}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{
+		APIKey:  "sk-ws-b",
+		Healthy: true,
+		JWT:     []byte("jwt-b"),
+	}
+
+	calls := 0
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: int64(len("Unauthenticated: an internal error occurred")),
+				Body:          io.NopCloser(bytes.NewBufferString("Unauthenticated: an internal error occurred")),
+				Header:        http.Header{"Grpc-Status": []string{"16"}},
+				Request:       req,
+			}, nil
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer jwt-b" {
+			t.Fatalf("retry request auth = %q, want %q", got, "Bearer jwt-b")
+		}
+		if got := req.Header.Get("X-Pool-Key-Used"); got != "sk-ws-b" {
+			t.Fatalf("retry request key = %q, want %q", got, "sk-ws-b")
+		}
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len("ok")),
+			Body:          io.NopCloser(bytes.NewBufferString("ok")),
+			Header:        make(http.Header),
+			Request:       req,
+		}, nil
+	})
+
+	rt := &retryTransport{base: base, proxy: proxy, maxRetry: 1}
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/test", bytes.NewBufferString("body"))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+	req.Header.Set("Authorization", "Bearer jwt-old-a")
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("RoundTrip() response is nil")
+	}
+	if calls != 2 {
+		t.Fatalf("RoundTrip() calls = %d, want 2", calls)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 0", refreshCalls)
+	}
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
 	}
 }
 
@@ -647,7 +973,7 @@ func TestRetryTransportGRPCStatus9EmptyBodyQuotaRotates(t *testing.T) {
 	}
 }
 
-func TestRetryTransportPermissionDeniedWireErrorRefreshesJWTAndRetries(t *testing.T) {
+func TestRetryTransportPermissionDeniedWireErrorRefreshesJWTWhenNoSpareKey(t *testing.T) {
 	originalGetJWT := getJWTByAPIKeyFn
 	t.Cleanup(func() {
 		getJWTByAPIKeyFn = originalGetJWT
@@ -709,5 +1035,163 @@ func TestRetryTransportPermissionDeniedWireErrorRefreshesJWTAndRetries(t *testin
 	}
 	if got := string(proxy.jwtBytesForKey("sk-ws-a")); got != "jwt-wire-sk-ws-a" {
 		t.Fatalf("jwtBytesForKey() = %q, want refreshed JWT", got)
+	}
+}
+
+func TestRetryTransportPermissionDeniedWireErrorRotatesToNextKeyBeforeRefreshingJWT(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+		injectCodeiumConfigFn = originalInject
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "jwt-wire-" + apiKey, nil
+	}
+	injectCodeiumConfigFn = func(apiKey string) error { return nil }
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{
+		APIKey:  "sk-ws-a",
+		Healthy: true,
+		JWT:     []byte("jwt-old"),
+	}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{
+		APIKey:  "sk-ws-b",
+		Healthy: true,
+		JWT:     []byte("jwt-b"),
+	}
+
+	calls := 0
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: int64(len(`{"code":"permission_denied","message":"permission denied (trace ID: abc)"}`)),
+				Body:          io.NopCloser(bytes.NewBufferString(`{"code":"permission_denied","message":"permission denied (trace ID: abc)"}`)),
+				Header:        http.Header{"Grpc-Status": []string{"7"}},
+				Request:       req,
+			}, nil
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer jwt-b" {
+			t.Fatalf("retry request auth = %q, want %q", got, "Bearer jwt-b")
+		}
+		if got := req.Header.Get("X-Pool-Key-Used"); got != "sk-ws-b" {
+			t.Fatalf("retry request key = %q, want %q", got, "sk-ws-b")
+		}
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len("ok")),
+			Body:          io.NopCloser(bytes.NewBufferString("ok")),
+			Header:        make(http.Header),
+			Request:       req,
+		}, nil
+	})
+
+	rt := &retryTransport{base: base, proxy: proxy, maxRetry: 1}
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/test", bytes.NewBufferString("body"))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+	req.Header.Set("Authorization", "Bearer jwt-old")
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("RoundTrip() response is nil")
+	}
+	if calls != 2 {
+		t.Fatalf("RoundTrip() calls = %d, want 2", calls)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 0", refreshCalls)
+	}
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
+	}
+}
+
+func TestRetryTransportRateLimitPermissionDeniedRotatesToNextKey(t *testing.T) {
+	originalGetJWT := getJWTByAPIKeyFn
+	originalInject := injectCodeiumConfigFn
+	t.Cleanup(func() {
+		getJWTByAPIKeyFn = originalGetJWT
+		injectCodeiumConfigFn = originalInject
+	})
+
+	refreshCalls := 0
+	getJWTByAPIKeyFn = func(_ *WindsurfService, apiKey string) (string, error) {
+		refreshCalls++
+		return "jwt-rate-" + apiKey, nil
+	}
+	injectCodeiumConfigFn = func(apiKey string) error { return nil }
+
+	proxy := NewMitmProxy(&WindsurfService{}, nil, "")
+	proxy.poolKeys = []string{"sk-ws-a", "sk-ws-b"}
+	proxy.keyStates["sk-ws-a"] = &PoolKeyState{APIKey: "sk-ws-a", Healthy: true, JWT: []byte("jwt-a")}
+	proxy.keyStates["sk-ws-b"] = &PoolKeyState{APIKey: "sk-ws-b", Healthy: true, JWT: []byte("jwt-b")}
+
+	calls := 0
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			body := "Permission denied: Rate limit exceeded. Your request was not processed, and no credits were used. Please upgrade to a Pro account for higher limits or try again in about an hour. Rate limit error"
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: int64(len(body)),
+				Body:          io.NopCloser(bytes.NewBufferString(body)),
+				Header:        http.Header{"Grpc-Status": []string{"7"}},
+				Request:       req,
+			}, nil
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer jwt-b" {
+			t.Fatalf("retry request auth = %q, want %q", got, "Bearer jwt-b")
+		}
+		if got := req.Header.Get("X-Pool-Key-Used"); got != "sk-ws-b" {
+			t.Fatalf("retry request key = %q, want %q", got, "sk-ws-b")
+		}
+		return &http.Response{
+			StatusCode:    200,
+			ContentLength: int64(len("ok")),
+			Body:          io.NopCloser(bytes.NewBufferString("ok")),
+			Header:        make(http.Header),
+			Request:       req,
+		}, nil
+	})
+
+	rt := &retryTransport{base: base, proxy: proxy, maxRetry: 1}
+	req, err := http.NewRequest(http.MethodPost, "https://server.self-serve.windsurf.com/test", bytes.NewBufferString("body"))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("X-Pool-Key-Used", "sk-ws-a")
+	req.Header.Set("Authorization", "Bearer jwt-a")
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("RoundTrip() response is nil")
+	}
+	if calls != 2 {
+		t.Fatalf("RoundTrip() calls = %d, want 2", calls)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("getJWTByAPIKeyFn calls = %d, want 0", refreshCalls)
+	}
+	if got := proxy.CurrentAPIKey(); got != "sk-ws-b" {
+		t.Fatalf("CurrentAPIKey() = %q, want %q", got, "sk-ws-b")
+	}
+	if state := proxy.keyStates["sk-ws-a"]; state == nil || state.Healthy || !state.CooldownUntil.After(time.Now()) || state.RuntimeExhausted {
+		t.Fatalf("old key state = %#v, want rate-limited cooldown without runtime exhaustion", state)
 	}
 }

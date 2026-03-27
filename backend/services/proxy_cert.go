@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -28,10 +29,26 @@ func caCertDir() string {
 	return filepath.Join(home, caDirName, caSubDir)
 }
 
-func caCertPath() string  { return filepath.Join(caCertDir(), "ca.pem") }
-func caKeyPath() string   { return filepath.Join(caCertDir(), "ca.key") }
+func caCertPath() string   { return filepath.Join(caCertDir(), "ca.pem") }
+func caKeyPath() string    { return filepath.Join(caCertDir(), "ca.key") }
 func hostCertPath() string { return filepath.Join(caCertDir(), "host.pem") }
 func hostKeyPath() string  { return filepath.Join(caCertDir(), "host.key") }
+
+func linuxSystemCACertPath() string {
+	return "/usr/local/share/ca-certificates/windsurf-tools-ca.crt"
+}
+
+func linuxCAInstalled(localCertPath, systemCertPath string) bool {
+	localData, err := os.ReadFile(localCertPath)
+	if err != nil || len(localData) == 0 {
+		return false
+	}
+	systemData, err := os.ReadFile(systemCertPath)
+	if err != nil || len(systemData) == 0 {
+		return false
+	}
+	return bytes.Equal(localData, systemData)
+}
 
 // EnsureCA generates a self-signed CA if not already present,
 // then generates a host certificate for the target domain.
@@ -218,11 +235,11 @@ func InstallCA() error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(dstFile, data, 0644); err != nil {
-			return fmt.Errorf("复制 CA 到系统目录失败(需要 sudo): %w", err)
+		if err := writeSystemFile(dstFile, data, 0644); err != nil {
+			return fmt.Errorf("复制 CA 到系统目录失败（Linux 会尝试 pkexec/sudo 提权）: %w", err)
 		}
-		cmd := exec.Command("update-ca-certificates")
-		if output, err := cmd.CombinedOutput(); err != nil {
+		output, err := runCommandWithPrivilege("update-ca-certificates")
+		if err != nil {
 			return fmt.Errorf("update-ca-certificates 失败: %s\n%s", err, string(output))
 		}
 	}
@@ -249,9 +266,8 @@ func UninstallCA() error {
 		}
 	default:
 		dstFile := "/usr/local/share/ca-certificates/windsurf-tools-ca.crt"
-		_ = os.Remove(dstFile)
-		cmd := exec.Command("update-ca-certificates", "--fresh")
-		_, _ = cmd.CombinedOutput()
+		_ = removeSystemFile(dstFile)
+		_, _ = runCommandWithPrivilege("update-ca-certificates", "--fresh")
 	}
 	return nil
 }
@@ -285,7 +301,7 @@ func isCAInstalledUncached() bool {
 		err := cmd.Run()
 		return err == nil
 	default:
-		return true // simplified check for non-Windows
+		return linuxCAInstalled(caCertPath(), linuxSystemCACertPath())
 	}
 }
 

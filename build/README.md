@@ -41,4 +41,4 @@ build with `wails build`.
 
 ## Preview Images
 
-- `browser-preview.png` - repo-facing preview image kept in sync with `docs/images/dashboard-preview.png`.
+- `browser-preview.png` - repo-facing preview image kept in sync with `docs/images/dashboard-preview.png`; keep it sanitized so no real account or session identifiers appear in repo-facing materials.

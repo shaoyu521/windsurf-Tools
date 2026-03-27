@@ -79,6 +79,7 @@ const (
 type PoolKeyState struct {
 	APIKey           string
 	JWT              []byte
+	JWTUpdatedAt     time.Time
 	Healthy          bool
 	RuntimeExhausted bool
 	CooldownUntil    time.Time
@@ -107,6 +108,13 @@ func (s *PoolKeyState) markExhausted() {
 	s.CooldownUntil = time.Now().Add(keyCooldownSec * time.Second)
 	s.ConsecutiveErrs = 0
 	s.TotalExhausted++
+}
+
+func (s *PoolKeyState) markRateLimited() {
+	s.Healthy = false
+	s.RuntimeExhausted = false
+	s.CooldownUntil = time.Now().Add(keyCooldownSec * time.Second)
+	s.ConsecutiveErrs = 0
 }
 
 func (s *PoolKeyState) isAvailable() bool {
@@ -287,6 +295,62 @@ func (p *MitmProxy) markRuntimeExhaustedAndRotate(usedKey, detail string) string
 		go cb(usedKey)
 	}
 	return rotatedKey
+}
+
+func (p *MitmProxy) rotateAfterAuthFailure(usedKey, detail string) string {
+	p.recordUpstreamFailure(upstreamFailureAuth, detail, usedKey)
+	p.clearJWT(usedKey)
+
+	p.mu.Lock()
+	rotatedKey := p.rotateKey()
+	poolSize := len(p.poolKeys)
+	p.mu.Unlock()
+
+	rotatedKey = strings.TrimSpace(rotatedKey)
+	if rotatedKey != "" && rotatedKey != strings.TrimSpace(usedKey) {
+		p.log("★ 认证失败轮转: %s... → %s... (pool=%d)", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))], poolSize)
+		p.syncCurrentAPIKeyToClient(rotatedKey)
+		if usedKey != "" && p.windsurfSvc != nil && p.windsurfSvc.client != nil {
+			go func(key string) {
+				refreshed := p.refreshJWTForKey(key)
+				if len(refreshed) == 0 {
+					p.log("认证失败后后台刷新 JWT 失败: %s...", key[:minStr(12, len(key))])
+				}
+			}(usedKey)
+		}
+		return rotatedKey
+	}
+	if poolSize <= 1 {
+		p.log("认证失败但号池无备用 key，回退 JWT 刷新: %s...", usedKey[:minStr(12, len(usedKey))])
+	} else {
+		p.log("认证失败轮转未找到可用备用 key，回退 JWT 刷新: %s...", usedKey[:minStr(12, len(usedKey))])
+	}
+	return ""
+}
+
+func (p *MitmProxy) markRateLimitedAndRotate(usedKey, detail string) string {
+	p.recordUpstreamFailure(upstreamFailureRateLimit, detail, usedKey)
+
+	p.mu.Lock()
+	if state := p.keyStates[usedKey]; state != nil {
+		state.markRateLimited()
+	}
+	rotatedKey := p.rotateKey()
+	poolSize := len(p.poolKeys)
+	p.mu.Unlock()
+
+	rotatedKey = strings.TrimSpace(rotatedKey)
+	if rotatedKey != "" && rotatedKey != strings.TrimSpace(usedKey) {
+		p.log("★ 限速轮转: %s... → %s... (pool=%d)", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))], poolSize)
+		p.syncCurrentAPIKeyToClient(rotatedKey)
+		return rotatedKey
+	}
+	if poolSize <= 1 {
+		p.log("当前 key 遇到限速且号池无备用 key: %s...", usedKey[:minStr(12, len(usedKey))])
+	} else {
+		p.log("当前 key 遇到限速但没有可立即轮转的备用 key: %s...", usedKey[:minStr(12, len(usedKey))])
+	}
+	return ""
 }
 
 func newQuotaStreamWatchBody(inner io.ReadCloser, onQuota func(detail string), onSuccess func()) *quotaStreamWatchBody {
@@ -677,6 +741,7 @@ type upstreamFailureKind string
 
 const (
 	upstreamFailureNone       upstreamFailureKind = ""
+	upstreamFailureRateLimit  upstreamFailureKind = "rate_limit"
 	upstreamFailureQuota      upstreamFailureKind = "quota"
 	upstreamFailureAuth       upstreamFailureKind = "auth"
 	upstreamFailureInternal   upstreamFailureKind = "internal"
@@ -729,16 +794,17 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		kind, detail := classifyUpstreamFailure(grpcStatus, grpcMsg, string(respBody))
 		isExhausted := kind == upstreamFailureQuota
+		isRateLimited := kind == upstreamFailureRateLimit
 		isAuthFailure := kind == upstreamFailureAuth
 		usedKey := req.Header.Get("X-Pool-Key-Used")
 
-		if (!isExhausted && !isAuthFailure) || attempt >= rt.maxRetry {
+		if (!isExhausted && !isAuthFailure && !isRateLimited) || attempt >= rt.maxRetry {
 			// 不是可重试的额度/认证错误，或已达最大重试次数，返回
-			if kind != upstreamFailureNone && kind != upstreamFailureQuota && kind != upstreamFailureAuth {
+			if kind != upstreamFailureNone && kind != upstreamFailureQuota && kind != upstreamFailureAuth && kind != upstreamFailureRateLimit {
 				rt.proxy.recordUpstreamFailure(kind, detail, usedKey)
 				rt.proxy.log("上游%s错误(不轮转): %s", kind.logLabel(), detail)
 			}
-			if kind == upstreamFailureAuth {
+			if kind == upstreamFailureAuth || kind == upstreamFailureRateLimit {
 				rt.proxy.recordUpstreamFailure(kind, detail, usedKey)
 				rt.proxy.log("上游%s错误(已达重试上限): %s", kind.logLabel(), detail)
 			}
@@ -747,31 +813,33 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		if isAuthFailure {
-			refreshedJWT := rt.proxy.refreshJWTForKey(usedKey)
-			if len(refreshedJWT) > 0 {
-				newBody, replaced := ReplaceIdentityInBody(savedBody, []byte(usedKey), refreshedJWT)
-				if replaced {
-					req.Body = io.NopCloser(bytes.NewReader(newBody))
-					req.ContentLength = int64(len(newBody))
-				} else {
-					req.Body = io.NopCloser(bytes.NewReader(savedBody))
-					req.ContentLength = int64(len(savedBody))
+			if rotatedKey := rt.proxy.rotateAfterAuthFailure(usedKey, detail); rotatedKey == "" {
+				refreshedJWT := rt.proxy.refreshJWTForKey(usedKey)
+				if len(refreshedJWT) > 0 {
+					newBody, replaced := ReplaceIdentityInBody(savedBody, []byte(usedKey), refreshedJWT)
+					if replaced {
+						req.Body = io.NopCloser(bytes.NewReader(newBody))
+						req.ContentLength = int64(len(newBody))
+					} else {
+						req.Body = io.NopCloser(bytes.NewReader(savedBody))
+						req.ContentLength = int64(len(savedBody))
+					}
+					req.Header.Set("Authorization", "Bearer "+string(refreshedJWT))
+					req.Header.Set("X-Pool-Key-Used", usedKey)
+					rt.proxy.log("★ 认证失败自动刷新 JWT(%d/%d): %s...",
+						attempt+1, rt.maxRetry,
+						usedKey[:minStr(12, len(usedKey))])
+					continue
 				}
-				req.Header.Set("Authorization", "Bearer "+string(refreshedJWT))
-				req.Header.Set("X-Pool-Key-Used", usedKey)
-				rt.proxy.log("★ 认证失败自动刷新 JWT(%d/%d): %s...",
-					attempt+1, rt.maxRetry,
-					usedKey[:minStr(12, len(usedKey))])
-				continue
-			}
 
-			rt.proxy.recordUpstreamFailure(kind, detail, usedKey)
-			rt.proxy.log("JWT 刷新失败，尝试切到下一把 key: %s...", usedKey[:minStr(12, len(usedKey))])
-			rt.proxy.mu.Lock()
-			rotatedKey := rt.proxy.rotateKey()
-			rt.proxy.mu.Unlock()
-			if rotatedKey != "" {
-				rt.proxy.syncCurrentAPIKeyToClient(rotatedKey)
+				rt.proxy.log("认证失败且 JWT 刷新失败，无可用备用 key: %s...", usedKey[:minStr(12, len(usedKey))])
+				resp.Body = io.NopCloser(bytes.NewReader(respBody))
+				return resp, nil
+			}
+		} else if isRateLimited {
+			if rotatedKey := rt.proxy.markRateLimitedAndRotate(usedKey, detail); rotatedKey == "" {
+				resp.Body = io.NopCloser(bytes.NewReader(respBody))
+				return resp, nil
 			}
 		} else {
 			// ★ 检测到额度耗尽，切号 + 重试
@@ -800,6 +868,11 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		if isAuthFailure {
 			rt.proxy.log("★ 认证失败切换重试(%d/%d): %s... → %s...",
+				attempt+1, rt.maxRetry,
+				usedKey[:minStr(12, len(usedKey))],
+				newKey[:minStr(12, len(newKey))])
+		} else if isRateLimited {
+			rt.proxy.log("★ 限速切换重试(%d/%d): %s... → %s...",
 				attempt+1, rt.maxRetry,
 				usedKey[:minStr(12, len(usedKey))],
 				newKey[:minStr(12, len(newKey))])
@@ -1011,6 +1084,18 @@ func (p *MitmProxy) handleResponse(resp *http.Response) {
 					isExhausted = true
 					exhaustedDetail = detail
 					p.log("额度耗尽: %s key=%s...", pathTail, usedKey[:minStr(12, len(usedKey))])
+				} else if kind == upstreamFailureRateLimit && isBilling {
+					p.log("限速命中: %s key=%s...", pathTail, usedKey[:minStr(12, len(usedKey))])
+					rotatedKey := p.markRateLimitedAndRotate(usedKey, detail)
+					if rotatedKey != "" {
+						p.log("★ 限速立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
+					}
+				} else if kind == upstreamFailureAuth && isBilling {
+					p.log("认证失败: %s key=%s...", pathTail, usedKey[:minStr(12, len(usedKey))])
+					rotatedKey := p.rotateAfterAuthFailure(usedKey, detail)
+					if rotatedKey != "" {
+						p.log("★ 认证失败立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
+					}
 				} else if kind != upstreamFailureNone && isBilling {
 					p.recordUpstreamFailure(kind, detail, usedKey)
 					p.log("上游%s错误: %s key=%s...", kind.logLabel(), detail, usedKey[:minStr(12, len(usedKey))])
@@ -1049,6 +1134,22 @@ func (p *MitmProxy) handleResponse(resp *http.Response) {
 					rotatedKey := p.markRuntimeExhaustedAndRotate(usedKey, detail)
 					if rotatedKey != "" {
 						p.log("★ 流式 trailer 额度耗尽立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
+					}
+					return
+				}
+				if kind == upstreamFailureRateLimit {
+					p.log("流式 trailer 限速命中: %s key=%s...", pathTail, usedKey[:minStr(12, len(usedKey))])
+					rotatedKey := p.markRateLimitedAndRotate(usedKey, detail)
+					if rotatedKey != "" {
+						p.log("★ 流式 trailer 限速立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
+					}
+					return
+				}
+				if kind == upstreamFailureAuth {
+					p.log("流式 trailer 认证失败: %s key=%s...", pathTail, usedKey[:minStr(12, len(usedKey))])
+					rotatedKey := p.rotateAfterAuthFailure(usedKey, detail)
+					if rotatedKey != "" {
+						p.log("★ 流式 trailer 认证失败立即轮转: %s... → %s...", usedKey[:minStr(12, len(usedKey))], rotatedKey[:minStr(12, len(rotatedKey))])
 					}
 					return
 				}
@@ -1126,20 +1227,14 @@ func (p *MitmProxy) pickPoolKeyAndJWT() (string, []byte) {
 		p.syncCurrentAPIKeyToClient(rotatedKey)
 	}
 
-	jwt := p.jwtBytesForKey(currentKey)
-	if len(jwt) == 0 {
-		jwt = p.ensureJWTForKey(currentKey)
-	}
+	jwt := p.usableJWTForKey(currentKey)
 
 	// If current key has no JWT, find one that does
 	if len(jwt) == 0 {
 		for i := 0; i < len(keys); i++ {
 			idx := (currentIdx + i) % len(keys)
 			k := keys[idx]
-			j := p.jwtBytesForKey(k)
-			if len(j) == 0 {
-				j = p.ensureJWTForKey(k)
-			}
+			j := p.usableJWTForKey(k)
 			if len(j) > 0 {
 				p.mu.Lock()
 				for liveIdx, liveKey := range p.poolKeys {
@@ -1260,6 +1355,7 @@ func (p *MitmProxy) updateJWT(apiKey string, jwt []byte) {
 	}
 	p.jwtLock.Lock()
 	state.JWT = jwt
+	state.JWTUpdatedAt = time.Now()
 	p.jwtLock.Unlock()
 }
 
@@ -1272,23 +1368,52 @@ func (p *MitmProxy) clearJWT(apiKey string) {
 	}
 	p.jwtLock.Lock()
 	state.JWT = nil
+	state.JWTUpdatedAt = time.Time{}
 	p.jwtLock.Unlock()
 }
 
-func (p *MitmProxy) jwtBytesForKey(apiKey string) []byte {
+func (p *MitmProxy) jwtSnapshotForKey(apiKey string) ([]byte, time.Time) {
 	p.mu.RLock()
 	state := p.keyStates[apiKey]
 	p.mu.RUnlock()
 	if state == nil {
-		return nil
+		return nil, time.Time{}
 	}
 	p.jwtLock.RLock()
 	defer p.jwtLock.RUnlock()
 	if len(state.JWT) == 0 {
-		return nil
+		return nil, state.JWTUpdatedAt
 	}
 	jwt := make([]byte, len(state.JWT))
 	copy(jwt, state.JWT)
+	return jwt, state.JWTUpdatedAt
+}
+
+func (p *MitmProxy) jwtBytesForKey(apiKey string) []byte {
+	jwt, _ := p.jwtSnapshotForKey(apiKey)
+	return jwt
+}
+
+func (p *MitmProxy) jwtNeedsRefresh(apiKey string) bool {
+	jwt, updatedAt := p.jwtSnapshotForKey(apiKey)
+	if len(jwt) == 0 || updatedAt.IsZero() {
+		return false
+	}
+	return time.Since(updatedAt) >= jwtRefreshMinutes*time.Minute
+}
+
+func (p *MitmProxy) usableJWTForKey(apiKey string) []byte {
+	jwt, _ := p.jwtSnapshotForKey(apiKey)
+	if len(jwt) == 0 {
+		return p.ensureJWTForKey(apiKey)
+	}
+	if p.jwtNeedsRefresh(apiKey) {
+		p.log("JWT 已过期，使用前强制刷新: %s...", apiKey[:minStr(12, len(apiKey))])
+		if refreshed := p.refreshJWTForKey(apiKey); len(refreshed) > 0 {
+			return refreshed
+		}
+		p.log("JWT 强制刷新失败，回退旧 JWT 使用: %s...", apiKey[:minStr(12, len(apiKey))])
+	}
 	return jwt
 }
 
@@ -1391,7 +1516,7 @@ func (p *MitmProxy) prefetchSpecificJWTs(keys []string, force bool) {
 		p.log("开始预取 %d 个 key 的 JWT...", len(keys))
 	}
 	for _, key := range keys {
-		if !force && len(p.jwtBytesForKey(key)) > 0 {
+		if !force && len(p.jwtBytesForKey(key)) > 0 && !p.jwtNeedsRefresh(key) {
 			continue
 		}
 		if force {
@@ -1407,7 +1532,7 @@ func (p *MitmProxy) prefetchJWTs() {
 	if len(keys) == 0 {
 		return
 	}
-	if len(p.jwtBytesForKey(keys[0])) > 0 {
+	if len(p.jwtBytesForKey(keys[0])) > 0 && !p.jwtNeedsRefresh(keys[0]) {
 		p.markJWTReady()
 		return
 	}
@@ -1473,6 +1598,8 @@ func (k upstreamFailureKind) logLabel() string {
 	switch k {
 	case upstreamFailureQuota:
 		return "额度"
+	case upstreamFailureRateLimit:
+		return "限速"
 	case upstreamFailureAuth:
 		return "认证"
 	case upstreamFailureInternal:
@@ -1504,6 +1631,9 @@ func classifyUpstreamFailure(grpcStatus, grpcMessage, bodyText string) (upstream
 	bodyLower := strings.ToLower(bodyText)
 	combined := strings.TrimSpace(bodyLower + "\n" + msgLower)
 
+	if isRateLimitText(combined) {
+		return upstreamFailureRateLimit, formatUpstreamFailureDetail(status, msg, bodyText)
+	}
 	// gRPC 8=RESOURCE_EXHAUSTED, 9=FAILED_PRECONDITION (Windsurf 额度耗尽常返回 9)
 	if status == "8" || isQuotaExhaustedText(combined) {
 		return upstreamFailureQuota, formatUpstreamFailureDetail(status, msg, bodyText)
@@ -1575,4 +1705,23 @@ func isQuotaExhaustedText(textLower string) bool {
 	}
 	return (strings.Contains(textLower, "failed_precondition") || strings.Contains(textLower, "failed precondition")) &&
 		(strings.Contains(textLower, "quota") || strings.Contains(textLower, "usage") || strings.Contains(textLower, "credits"))
+}
+
+func isRateLimitText(textLower string) bool {
+	patterns := []string{
+		"rate limit exceeded",
+		"rate limit error",
+		"rate limit",
+		"rate_limit",
+		"too many requests",
+		"try again in about an hour",
+		"higher limits",
+		"no credits were used",
+	}
+	for _, pat := range patterns {
+		if strings.Contains(textLower, pat) {
+			return true
+		}
+	}
+	return false
 }
